@@ -1,3 +1,13 @@
+---
+title: Energy Dashboard
+emoji: 📊
+colorFrom: indigo
+colorTo: blue
+sdk: docker
+app_file: app.py
+pinned: true
+---
+
 # Energy Dashboard v5.0
 
 **A real-time energy market analysis dashboard for crude oil traders.**
