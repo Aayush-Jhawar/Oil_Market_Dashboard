@@ -1,0 +1,18 @@
+app = "energy-dashboard"
+primary_region = "ord"
+
+[env]
+  PYTHONUNBUFFERED = "1"
+  PORT = "8000"
+
+[[services]]
+  internal_port = 8000
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+    force_https = true
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]

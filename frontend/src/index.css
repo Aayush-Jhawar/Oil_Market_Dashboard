@@ -1,0 +1,101 @@
+@import 'tailwindcss/base';
+@import 'tailwindcss/components';
+@import 'tailwindcss/utilities';
+
+:root {
+  --bg-primary: #080E18;
+  --bg-secondary: #0D1829;
+  --bg-tertiary: #111F35;
+  --border: #1E3050;
+  --border-bright: #2A4570;
+
+  --text-primary: #E8EEF7;
+  --text-secondary: #8BA3C7;
+  --text-muted: #4A6A96;
+
+  --accent-blue: #3B82F6;
+  --accent-cyan: #06B6D4;
+
+  --bull: #10B981;
+  --bull-dim: #064E3B;
+  --bear: #EF4444;
+  --bear-dim: #450A0A;
+  --neutral: #6B7280;
+  --amber: #F59E0B;
+  --amber-dim: #451A03;
+
+  --header-bg: #050B14;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: 'Inter', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+@keyframes flash-green {
+  0%, 100% { background-color: transparent; }
+  50% { background-color: rgba(16, 185, 129, 0.2); }
+}
+
+@keyframes flash-red {
+  0%, 100% { background-color: transparent; }
+  50% { background-color: rgba(239, 68, 68, 0.2); }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.flash-green {
+  animation: flash-green 0.4s ease-in-out;
+}
+
+.flash-red {
+  animation: flash-red 0.4s ease-in-out;
+}
+
+.pulse-stale {
+  animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+.card {
+  @apply rounded-card border border-energy-border bg-energy-bg-secondary p-md;
+}
+
+.badge {
+  @apply inline-block rounded-full px-2 py-1 text-xs font-semibold uppercase tracking-widest;
+}
+
+.badge-green {
+  @apply bg-energy-bull-dim text-energy-bull;
+}
+
+.badge-red {
+  @apply bg-energy-bear-dim text-energy-bear;
+}
+
+.badge-amber {
+  @apply bg-energy-amber-dim text-energy-amber;
+}
+
+.badge-blue {
+  @apply bg-blue-950 text-energy-accent-blue;
+}
+
+.tab-active {
+  @apply border-b-2 border-energy-accent-blue text-energy-text-primary;
+}
+
+.tab-inactive {
+  @apply border-b-2 border-transparent text-energy-text-secondary hover:bg-energy-bg-tertiary;
+}
