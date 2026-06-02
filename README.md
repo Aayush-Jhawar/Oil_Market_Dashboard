@@ -3,7 +3,7 @@ title: Energy Dashboard
 emoji: 📊
 colorFrom: indigo
 colorTo: blue
-sdk: docker
+sdk: python
 app_file: app.py
 pinned: true
 ---
