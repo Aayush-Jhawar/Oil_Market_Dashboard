@@ -13,7 +13,7 @@
 
 *Live prices · Crack spreads · Forward curves · Backtesting · Paper trading · EIA fundamentals*
 
-### ▶︎ **[Launch the live dashboard →](https://huggingface.co/spaces/YourGrimReaper/Oil-Market-Dashboard)**
+### ▶︎ **[Launch the live dashboard](https://huggingface.co/spaces/YourGrimReaper/Oil-Market-Dashboard)**
 
 </div>
 
@@ -21,7 +21,7 @@
 
 ## 🌐 Live Demo
 
-The dashboard is deployed as a Docker Space on Hugging Face and runs entirely in the browser — no setup required:
+The dashboard is deployed as a Docker Space on Hugging Face and runs entirely in the browser:
 
 | | |
 |---|---|
@@ -36,7 +36,7 @@ The dashboard is deployed as a Docker Space on Hugging Face and runs entirely in
 
 ## 📸 Overview
 
-The Oil Market Dashboard is a trader-facing analytics console that surfaces **live commodity prices, spread analytics, macro context, and quantitative signals** for energy market participants. It covers 5 core products — WTI, Brent, RBOB, Heating Oil, and Gasoil — across multiple analytical dimensions.
+The Oil Market Dashboard is a trader-facing analytics console that surfaces **live commodity prices, spread analytics, macro context, and quantitative signals** for energy market participants. It covers 5 core products (WTI, Brent, RBOB, Heating Oil, and Gasoil) across multiple analytical dimensions.
 
 ```
 Live WebSocket prices ─► Signal Engine ─► React Dashboard
@@ -173,14 +173,14 @@ npm run dev
 
 The dashboard auto-deploys to Hugging Face Spaces on every push to `main`.
 
-**Pipeline** — `.github/workflows/sync_to_hf.yml`:
+**Pipeline** `.github/workflows/sync_to_hf.yml`:
 
 1. GitHub Actions checks out the repository (no LFS — the deployed app does not need the raw datasets).
 2. The application code, frontend, and `Dockerfile` are synced to the Space via the Hugging Face API.
 3. Two lightweight pre-built SQLite seed databases are shipped to their runtime paths so the dashboard
    works without the multi-GB raw data:
-   - `backend/energy_deploy.db` → `backend/energy.db` — historical prices & forward-curve structure
-   - `DB/bars_15min_deploy.db` → `DB/bars_15min_latest.db` — 15-min candles for live prices & paper trading
+   - `backend/energy_deploy.db` → `backend/energy.db`: historical prices & forward-curve structure
+   - `DB/bars_15min_deploy.db` → `DB/bars_15min_latest.db`: 15-min candles for live prices & paper trading
 4. Hugging Face builds the Docker image and serves the app on port `7860`.
 
 > The seed databases are rebuilt locally with `python _prep_deploy_db.py` and `python _build_slim_db.py`,
@@ -270,25 +270,25 @@ the keys above only enable the live external feeds.
 ## 🔧 Technology Stack
 
 **Backend**
-- [FastAPI](https://fastapi.tiangolo.com/) — async API framework
-- [SQLAlchemy](https://sqlalchemy.org/) + SQLite — persistence layer
-- [Pandas](https://pandas.pydata.org/) + [PyArrow](https://arrow.apache.org/docs/python/) — high-frequency data processing
-- [Polars](https://pola.rs/) — blazing-fast dataset queries
-- [Celery](https://docs.celeryq.dev/) + [Redis](https://redis.io/) — background task queue
+- [FastAPI](https://fastapi.tiangolo.com/) - async API framework
+- [SQLAlchemy](https://sqlalchemy.org/) + SQLite  persistence layer
+- [Pandas](https://pandas.pydata.org/) + [PyArrow](https://arrow.apache.org/docs/python/)  high-frequency data processing
+- [Polars](https://pola.rs/) - blazing-fast dataset queries
+- [Celery](https://docs.celeryq.dev/) + [Redis](https://redis.io/) - background task queue
 
 **Frontend**
-- [React 18](https://reactjs.org/) + [TypeScript](https://typescriptlang.org/) — UI framework
-- [Vite](https://vitejs.dev/) — build tooling
-- [Zustand](https://zustand-demo.pmnd.rs/) — lightweight state management
-- [Recharts](https://recharts.org/) — charting library
-- [TailwindCSS](https://tailwindcss.com/) — utility-first styling
+- [React 18](https://reactjs.org/) + [TypeScript](https://typescriptlang.org/) - UI framework
+- [Vite](https://vitejs.dev/) - build tooling
+- [Zustand](https://zustand-demo.pmnd.rs/) - lightweight state management
+- [Recharts](https://recharts.org/) - charting library
+- [TailwindCSS](https://tailwindcss.com/) - utility-first styling
 
 **Data**
-- Yahoo Finance chart API — live price feed
-- EIA OpenData API — U.S. energy fundamentals
-- CFTC public data — commitment of traders positioning
-- Baker Hughes — weekly rig count
-- RSS feeds — energy news ingestion
+- Yahoo Finance chart API - live price feed
+- EIA OpenData API - U.S. energy fundamentals
+- CFTC public data - commitment of traders positioning
+- Baker Hughes - weekly rig count
+- RSS feeds - energy news ingestion
 
 ---
 
