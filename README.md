@@ -132,6 +132,9 @@ Start the backend:
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
+> [!NOTE]
+> **First run only:** On first startup, the backend will automatically build `energy.db` from the Parquet datasets. This takes **5–10 minutes** and only happens once. Every subsequent start is instant.
+
 ### 3. Frontend setup
 ```bash
 cd frontend
