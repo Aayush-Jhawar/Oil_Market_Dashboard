@@ -2,10 +2,10 @@ import { useDashboardStore } from '../../store/useStore'
 import { useDashboardStore as useSnapshotStore } from '../../store/dashboardStore'
 
 interface HeaderBarProps {
-  onSettingsClick: () => void
+  onSettingsClick?: () => void
 }
 
-export default function HeaderBar({ onSettingsClick }: HeaderBarProps) {
+export default function HeaderBar(_props: HeaderBarProps) {
   const { prices, signals } = useDashboardStore()
 
   const wti = prices['WTI']
