@@ -13,15 +13,33 @@ pinned: false
 
 **A professional-grade, real-time energy trading analytics platform**
 
+[![Live Demo](https://img.shields.io/badge/🤗_Live_Demo-Hugging_Face_Space-FFD21E?style=for-the-badge)](https://huggingface.co/spaces/YourGrimReaper/Oil-Market-Dashboard)
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.111+-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![React](https://img.shields.io/badge/React-18+-61DAFB?style=for-the-badge&logo=react&logoColor=black)](https://reactjs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5+-3178C6?style=for-the-badge&logo=typescript&logoColor=white)](https://typescriptlang.org)
-[![License](https://img.shields.io/badge/License-Proprietary-red?style=for-the-badge)](LICENSE)
+[![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://www.docker.com)
 
 *Live prices · Crack spreads · Forward curves · Backtesting · Paper trading · EIA fundamentals*
 
+### ▶︎ **[Launch the live dashboard →](https://huggingface.co/spaces/YourGrimReaper/Oil-Market-Dashboard)**
+
 </div>
+
+---
+
+## 🌐 Live Demo
+
+The dashboard is deployed as a Docker Space on Hugging Face and runs entirely in the browser — no setup required:
+
+| | |
+|---|---|
+| **🤗 Hugging Face Space** | https://huggingface.co/spaces/YourGrimReaper/Oil-Market-Dashboard |
+| **🔗 Direct app URL** | https://yourgrimreaper-oil-market-dashboard.hf.space |
+
+> The hosted instance ships with a pre-built historical database, so forward curves, market structure,
+> signals, and the paper-trading book are populated out of the box. Live price/fundamental feeds activate
+> when the corresponding API keys are configured as Space secrets (see [Deployment](#️-deployment)).
 
 ---
 
@@ -157,6 +175,38 @@ npm run dev
 | 🖥️ Dashboard | http://localhost:5173 |
 | ⚙️ API Server | http://localhost:8000 |
 | 📚 API Docs | http://localhost:8000/docs |
+
+---
+
+## ☁️ Deployment
+
+The dashboard auto-deploys to Hugging Face Spaces on every push to `main`.
+
+**Pipeline** — `.github/workflows/sync_to_hf.yml`:
+
+1. GitHub Actions checks out the repository (no LFS — the deployed app does not need the raw datasets).
+2. The application code, frontend, and `Dockerfile` are synced to the Space via the Hugging Face API.
+3. Two lightweight pre-built SQLite seed databases are shipped to their runtime paths so the dashboard
+   works without the multi-GB raw data:
+   - `backend/energy_deploy.db` → `backend/energy.db` — historical prices & forward-curve structure
+   - `DB/bars_15min_deploy.db` → `DB/bars_15min_latest.db` — 15-min candles for live prices & paper trading
+4. Hugging Face builds the Docker image and serves the app on port `7860`.
+
+> The seed databases are rebuilt locally with `python _prep_deploy_db.py` and `python _build_slim_db.py`,
+> then committed. Regenerate and commit them whenever you want the hosted demo to reflect newer data.
+
+### Required secrets
+
+| Location | Secret | Purpose |
+|----------|--------|---------|
+| GitHub repo secrets | `HF_TOKEN` | Hugging Face write token used by the deploy workflow |
+| HF Space secrets | `TWELVE_DATA_KEY` | Live spot prices |
+| HF Space secrets | `EIA_API_KEY` | EIA fundamentals / weekly anchors |
+| HF Space secrets | `AISSTREAM_KEY` | Live tanker positions |
+| HF Space secrets | `FRED_API_KEY` | Macro indicators |
+
+Core analytics (history, curves, signals, paper trading) run from the seed data **without** any keys;
+the keys above only enable the live external feeds.
 
 ---
 
