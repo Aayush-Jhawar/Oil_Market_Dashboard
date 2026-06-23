@@ -1,0 +1,26 @@
+{
+  "WTI": {
+    "mm_net_long": -27568,
+    "mm_net_change": -874,
+    "producer_net_short": -88963,
+    "open_interest": 818492,
+    "data_source": "cftc_live",
+    "timestamp": "2026-06-22T05:25:26.286697"
+  },
+  "RBOB": {
+    "mm_net_long": 64125,
+    "mm_net_change": -3648,
+    "producer_net_short": 79363,
+    "open_interest": 314521,
+    "data_source": "cftc_live",
+    "timestamp": "2026-06-22T05:25:26.298013"
+  },
+  "HO": {
+    "mm_net_long": 9507,
+    "mm_net_change": -2490,
+    "producer_net_short": 63726,
+    "open_interest": 254634,
+    "data_source": "cftc_live",
+    "timestamp": "2026-06-22T05:25:26.306406"
+  }
+}

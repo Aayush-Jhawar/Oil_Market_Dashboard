@@ -41,8 +41,8 @@ CACHE_PRICE_DATA = True
 CACHE_DURATION_SECONDS = 300  # 5 minutes
 
 # Data source settings
-# When yfinance fails or is unavailable, use fallback prices
-FALLBACK_TO_DEFAULTS = True
+# DISABLED: Do not use fallback prices - only show real data from yfinance
+FALLBACK_TO_DEFAULTS = False
 ALLOW_EMPTY_HISTORY = True  # Allow returning empty history instead of failing
 
 # Environment string for logging

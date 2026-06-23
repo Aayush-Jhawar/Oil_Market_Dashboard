@@ -150,6 +150,7 @@ export interface RigCountData {
   permian_rigs: number;
   wow_change: number;
   yoy_change: number;
+  data_source?: string;
   timestamp: string;
 }
 
@@ -161,7 +162,9 @@ export type DashboardTab =
   | 'spreads'
   | 'news'
   | 'anchor'
-  | 'protools'
+  | 'prediction'
+  | 'backtest'
+  | 'portfolio'
 
 // API Response wrapper
 export interface ApiResponse<T> {
@@ -172,11 +175,17 @@ export interface ApiResponse<T> {
 }
 
 // Dashboard Store State
+export type FetchStatus = 'loading' | 'ready' | 'unavailable';
+
 export interface DashboardStore {
   // Data
   prices: Record<string, PricePoint>;
   historicalPrices: Record<string, HistoricalPrice[]>;
   eiaData: Record<string, EIADataPoint>;
+  // Fetch lifecycle for fundamentals so the UI can distinguish "still loading"
+  // from "loaded but empty / request failed" instead of hanging on "Loading...".
+  eiaStatus: FetchStatus;
+  cftcStatus: FetchStatus;
   news: NewsItem[];
   signals: SignalScore | null;
   cracks: CrackSpreads | null;
@@ -187,6 +196,9 @@ export interface DashboardStore {
   analytics: AnalyticsCorrelation | null;
   enhancedSignals: EnhancedSignals | null;
   indicators?: Record<string, any> | null;
+  tankerData?: any | null;
+  stormData?: any | null;
+  anchorData?: any | null;
 
   // Settings
   baseSizeContracts: number;
@@ -208,10 +220,15 @@ export interface DashboardStore {
   setRigs: (rigs: RigCountData) => void;
   setCFTC: (cftc: Record<string, CFTCData>) => void;
   setEIAData: (data: Record<string, EIADataPoint>) => void;
+  setEIAStatus: (status: FetchStatus) => void;
+  setCFTCStatus: (status: FetchStatus) => void;
   setForwardCurve: (curve: ForwardCurvePoint[]) => void;
   setAnalytics: (analytics: AnalyticsCorrelation) => void;
   setEnhancedSignals: (enhancedSignals: EnhancedSignals) => void;
   setIndicators: (indicators: Record<string, any>) => void;
+  setTankerData: (data: any) => void;
+  setStormData: (data: any) => void;
+  setAnchorData: (data: any) => void;
   setActiveTab: (tab: DashboardTab) => void;
   setTimeframe: (tf: '1D' | '5D' | '1M') => void;
   setBaseSizeContracts: (size: number) => void;

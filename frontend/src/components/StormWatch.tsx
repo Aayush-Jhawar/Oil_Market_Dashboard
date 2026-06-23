@@ -8,11 +8,13 @@ interface StormWatchProps {
       category?: string
       lat?: number
       lon?: number
-      wind_kt?: number
-      at_risk_refineries?: Array<{ name: string; capacity_mbpd: number; distance_nm: number }>
+      intensity_kt?: number
+      oil_impact?: {
+        refineries_at_risk?: Array<{ name: string; capacity_kbpd: number; distance_nm: number }>
+      }
     }>
-    total_at_risk_capacity_mbpd?: number
-    season_active?: boolean
+    overall_status?: string
+    gulf_total_capacity_kbpd?: number
     timestamp?: string
     source?: string
     error?: string
@@ -21,15 +23,26 @@ interface StormWatchProps {
 
 export default function StormWatch({ data }: StormWatchProps) {
   const storms = data?.storms || []
-  const seasonActive = data?.season_active ?? false
-  const totalAtRisk = data?.total_at_risk_capacity_mbpd ?? 0
+  
+  // Calculate total at-risk capacity from the new oil_impact structure
+  const totalAtRiskKbpd = storms.reduce((total, storm) => {
+    const atRisk = storm.oil_impact?.refineries_at_risk || []
+    const stormTotal = atRisk.reduce((sum, r) => sum + (r.capacity_kbpd || 0), 0)
+    return total + stormTotal
+  }, 0)
+  
+  const totalAtRiskMbpd = totalAtRiskKbpd / 1000
+
+  // The season is active if the current month is between June (5) and November (10)
+  const currentMonth = new Date().getMonth()
+  const seasonActive = currentMonth >= 5 && currentMonth <= 10
 
   return (
     <Card title="Storm Watch">
       <div className="space-y-4">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <div className="text-sm font-medium">Active Atlantic / Gulf storms</div>
+            <div className="text-sm font-medium">Active NHC storms</div>
             <div className="text-xs text-slate-400">Markets typically price storm risk 3–5 days before landfall.</div>
           </div>
           <Badge variant={seasonActive ? 'green' : 'amber'}>
@@ -42,7 +55,7 @@ export default function StormWatch({ data }: StormWatchProps) {
             {storms.length} active storm{storms.length === 1 ? '' : 's'}
           </div>
           <div className="rounded-full bg-slate-900 px-3 py-2 text-slate-300">
-            {totalAtRisk.toFixed(2)} mbpd at risk
+            {totalAtRiskMbpd.toFixed(2)} mbpd at risk
           </div>
         </div>
 
@@ -65,7 +78,7 @@ export default function StormWatch({ data }: StormWatchProps) {
                   <div className="grid grid-cols-3 gap-3 text-sm text-slate-300">
                     <div>
                       <div className="text-xs uppercase text-slate-500">Wind kt</div>
-                      <div>{storm.wind_kt ?? '—'}</div>
+                      <div>{storm.intensity_kt ?? '—'}</div>
                     </div>
                     <div>
                       <div className="text-xs uppercase text-slate-500">Latitude</div>
@@ -77,14 +90,14 @@ export default function StormWatch({ data }: StormWatchProps) {
                     </div>
                   </div>
                 </div>
-                {storm.at_risk_refineries?.length ? (
+                {storm.oil_impact?.refineries_at_risk?.length ? (
                   <div className="mt-4 space-y-2 rounded-2xl bg-slate-950/70 p-3 text-sm text-slate-300">
                     <div className="text-xs uppercase tracking-[0.2em] text-slate-500">At-risk refineries</div>
                     <div className="grid gap-2 sm:grid-cols-2">
-                      {storm.at_risk_refineries.map((refinery, idx) => (
+                      {storm.oil_impact.refineries_at_risk.map((refinery, idx) => (
                         <div key={idx} className="rounded-2xl bg-slate-900 p-3">
                           <div className="font-medium text-white">{refinery.name}</div>
-                          <div className="text-xs text-slate-400">{refinery.capacity_mbpd.toFixed(2)} mbpd</div>
+                          <div className="text-xs text-slate-400">{(refinery.capacity_kbpd / 1000).toFixed(2)} mbpd</div>
                           <div className="text-xs text-slate-400">{refinery.distance_nm.toFixed(1)} nm away</div>
                         </div>
                       ))}

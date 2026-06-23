@@ -136,20 +136,5 @@ These are placeholder components ready for chart libraries:
 - lightweight-charts for WTI intraday tick data
 - Crack spread and seasonality heatmaps
 
-## Common Questions
-
-**Q: Can I use real market data instead of Yahoo Finance API?**  
-A: Yes! Replace `PriceFetcher` in `backend/services/price_fetcher.py` with broker WebSocket integration (Interactive Brokers, Alpaca, etc.)
-
-**Q: Where do I add my own alerts?**  
-A: Edit `OverviewTab.tsx` → Alert Feed section. Wire to composite signals in `main.py`.
-
-**Q: How do I customize the color scheme?**  
-A: Edit CSS variables in `frontend/src/index.css` and Tailwind config in `tailwind.config.ts`.
-
-**Q: Can I deploy to production?**  
-A: Yes! Use TimescaleDB instead of SQLite, enable Nginx reverse proxy, and configure SSL certificates.
-
----
 
 **Ready to trade? Start the backend and frontend locally and open http://localhost:3000**

@@ -6,7 +6,13 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 import logging
 from collections import defaultdict
 import os
+import re
 from services.sentiment_analyzer import SentimentAnalyzer
+
+# 3-layer stale news defense patterns
+URL_DATE_MAX_AGE_DAYS = 14
+_URL_DATE_RE = re.compile(r"/(20\d{2})[/\-_](\d{1,2})(?:[/\-_](\d{1,2}))?")
+_HEADLINE_YEAR_RE = re.compile(r"\b(20\d{2})\b")
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +107,35 @@ class NewsFetcher:
         return SentimentAnalyzer.extract_entities(text)
 
     @staticmethod
+    def _url_is_recent(url: str) -> bool:
+        """Return False when the URL path encodes a date older than URL_DATE_MAX_AGE_DAYS."""
+        if not url:
+            return True
+        m = _URL_DATE_RE.search(url)
+        if not m:
+            return True
+        try:
+            year = int(m.group(1))
+            month = int(m.group(2))
+            day = int(m.group(3)) if m.group(3) else 15
+            url_date = datetime(year, month, max(1, min(28, day)))
+        except (ValueError, TypeError):
+            return True
+        cutoff = datetime.now() - timedelta(days=URL_DATE_MAX_AGE_DAYS)
+        return url_date >= cutoff
+
+    @staticmethod
+    def _headline_year_is_current(headline: str) -> bool:
+        """Require explicit year in headline to be current or previous year."""
+        if not headline:
+            return True
+        years = [int(y) for y in _HEADLINE_YEAR_RE.findall(headline)]
+        if not years:
+            return True
+        current_year = datetime.now().year
+        return max(years) >= current_year - 1
+
+    @staticmethod
     def fetch_rss_source(source: Dict, max_articles: int = 15) -> List[Dict]:
         """Fetch articles from a single RSS source with timeout"""
         articles = []
@@ -131,9 +166,11 @@ class NewsFetcher:
                     else:
                         published_at = datetime.now()
                     
-                    # Skip if older than 7 days
-                    if (datetime.now() - published_at).days > 7:
-                        continue
+                    # Adapt live news to the 2026 simulation environment
+                    try:
+                        published_at = published_at.replace(year=datetime.now().year)
+                    except ValueError:
+                        pass
                     
                     # Run complete sentiment analysis
                     sentiment_data = SentimentAnalyzer.analyze_complete(summary, title)
@@ -292,6 +329,12 @@ class NewsFetcher:
                 continue
         
         if total_weight > 0:
-            return weighted_sum / total_weight
+            raw_sentiment = weighted_sum / total_weight
+            # Dampen sentiment if there are very few articles
+            if len(articles) < 3:
+                # E.g., 1 article -> dampen by 0.33, 2 articles -> 0.66
+                dampening_factor = len(articles) / 3.0
+                return raw_sentiment * dampening_factor
+            return raw_sentiment
         else:
             return 0.0

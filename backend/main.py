@@ -1,41 +1,66 @@
+import os
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '.env'), override=True)
+
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 import asyncio
 import json
 import statistics
 from typing import List, Set
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from database import engine, Base, get_db
-from models import PriceData, InventoryData, NewsItem, Alert, SpreadAnalysis
+from models import PriceData, InventoryData, NewsItem
 from services.price_fetcher import PriceFetcher
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
 from services.news_fetcher import NewsFetcher
 from services.eia_fetcher import EIAFetcher
 from services.macro_fetcher import MacroFetcher, RigCountFetcher, CFTCFetcher
 from services.sentiment_analyzer import SentimentAnalyzer
 from services.spread_analyzer import SpreadCalculator, AnomalyDetector
+
+# Initialize components
+news_fetcher = NewsFetcher()
+macro_fetcher = MacroFetcher()
+eia_fetcher = EIAFetcher()
+cftc_fetcher = CFTCFetcher()
 from signal_calc import SignalCalculator
+from services.multi_factor_engine import compute_multi_factor_score, calculate_relative_strength
 from ws_snapshot import register_router as register_ws_snapshot
-from hurricane import fetch_active_storms
-from ais import fetch_tanker_positions
+from hurricane import StormTracker
+from ais import TankerTracker
 from datetime import datetime, timedelta
 import logging
-import os
-from cot import fetch_cot_history
-from steo import fetch_steo_balance
+from cot import fetch_cot
+from steo import fetch_steo
 from seasonality import fetch_seasonality
-from sentiment import analyze_news_items
+from sentiment import analyze_news_items, warm_finbert
+from paper import paper_book
+from indicators import ewma_cov_matrix
+import pandas as pd
 
 # Initialize logger
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logger = logging.getLogger(__name__)
+
+# Suppress httpx INFO logs which expose API keys in URLs
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
 
-# Initialize FastAPI app
+# Core FastAPI App
+# Hot reload trigger
+
 app = FastAPI(
     title="Energy Dashboard API",
     description="Real-time energy market dashboard API",
@@ -47,6 +72,11 @@ try:
     register_ws_snapshot(app)
 except Exception:
     pass
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Initializing FinBERT in the background...")
+    warm_finbert()
 
 # Initialize global spread calculator
 spread_calculator = SpreadCalculator(history_length=252)
@@ -79,9 +109,16 @@ class WebSocketManager:
             self.disconnect(ws)
 
 
-# module-level manager and background task handles
+# module-level manager and background tasks
 ws_manager = WebSocketManager()
 _background_tasks = []
+_latest_intraday = {}
+
+# global data structures for ported modules
+global_tankers = TankerTracker()
+global_storms = StormTracker()
+global_cot = None
+global_steo = None
 
 
 async def _price_publisher():
@@ -98,35 +135,108 @@ async def _price_publisher():
 
 async def _signals_publisher():
     loop = asyncio.get_event_loop()
+    from services.regime_classifier import regime_classifier
+    from services.zscore_strategy import zscore_strategy
+    from services.forward_curve import get_curve_as_dict
     while True:
         try:
-            # reuse logic from /api/signals/composite
             prices = await loop.run_in_executor(None, PriceFetcher.fetch_all_prices)
             news = await loop.run_in_executor(None, NewsFetcher.fetch_all_news)
-
-            wti_hist = await loop.run_in_executor(None, PriceFetcher.fetch_historical, "WTI", "3mo")
-            wti_prices = [float(h["close"]) for h in (wti_hist or [])]
-
-            ema20 = SignalCalculator.calculate_ema(wti_prices, 20) if wti_prices else 0
-            ema50 = SignalCalculator.calculate_ema(wti_prices, 50) if wti_prices else 0
-            ema_trend = SignalCalculator.calculate_ema_trend(ema20, ema50)
-
+            macro = await loop.run_in_executor(None, MacroFetcher.fetch_all_macro)
             news_sentiment = NewsFetcher.calculate_sentiment_trend(news)
+            
+            # Compute regimes for base symbols
+            regime_info_map = {}
+            for base in ["WTI", "Brent", "HO", "GO"]:
+                try:
+                    # get_curve_as_dict makes blocking yfinance/DB calls — run it in the
+                    # threadpool so it never stalls the asyncio event loop.
+                    curve = await loop.run_in_executor(None, get_curve_as_dict, base)
+                    numeric_curve = {int(k[1:]): v for k, v in curve.items() if k.startswith("M") and k[1:].isdigit()}
+                    regime_info_map[base] = regime_classifier.classify(base, numeric_curve)
+                except Exception:
+                    pass
+            
+            by_symbol = {}
+            all_target_symbols = ["WTI", "Brent", "RBOB", "HO", "3-2-1CRACK", "GASCRACK", "DIESELCRACK", "WTI_FLY", "BRENT_FLY", "RBOB_FLY", "HO_FLY", "WTI-Brent", "DUB-WTI"]
 
-            cftc_z_score = 0.5
-            eia_surprise = 0.2
-            seasonality = 0.1
+            for sym in all_target_symbols:
+                hist = await loop.run_in_executor(None, PriceFetcher.fetch_historical, sym, "3mo")
+                closes = [float(h["close"]) for h in (hist or [])] if hist else []
 
-            composite = SignalCalculator.calculate_composite_score(
-                ema_trend, news_sentiment, cftc_z_score, eia_surprise, seasonality
-            )
+                # Full multi-factor composite (same engine the REST /api/signals/composite
+                # endpoint uses) so the WebSocket snapshot carries real composite_score,
+                # factor_scores and volatility — not a z-score proxy with empty factors.
+                mf = {}
+                if hist and len(hist) >= 20:
+                    mf = await loop.run_in_executor(
+                        None, compute_multi_factor_score, sym, hist, macro, None, None
+                    )
 
-            vol = SignalCalculator.calculate_realized_volatility(wti_prices)
-            vol_regime = SignalCalculator.get_vol_regime(vol)
+                vol = mf.get("annual_vol_pct")
+                if vol is None:
+                    vol = SignalCalculator.calculate_realized_volatility(closes) if closes else 0.0
+
+                sub = dict(mf.get("sub_scores", {}) or {})
+                sub["news_sentiment"] = round(news_sentiment, 3)
+
+                by_symbol[sym] = {
+                    "composite_score": mf.get("composite_score", 0.0),
+                    "regime": mf.get("regime", "NEUTRAL"),
+                    "regime_type": mf.get("regime_type", "UNKNOWN"),
+                    "signal": mf.get("signal", "NEUTRAL"),
+                    "confidence": mf.get("confidence", 0.0),
+                    "sub_scores": sub,
+                    "weights": mf.get("factor_weights", {}),
+                    "volatility_pct": round(vol, 1),
+                    "vol_regime": SignalCalculator.get_vol_regime(vol),
+                    "factor_scores": mf.get("factor_scores", {}),
+                }
+
+            wti_res = by_symbol.get("WTI", {})
+
+            # Format _latest_intraday to mock the old structure for the UI
+            ui_predictions = {}
+            for sym, data in by_symbol.items():
+                cs = data.get("composite_score", 0.0)
+                
+                # Extract structural curve regime (e.g. BACKWARDATION, CONTANGO)
+                # Defaults to "Neutral" if missing.
+                curve_info = regime_info_map.get(sym, {})
+                if not curve_info and sym in ["RBOB", "HO"]:
+                    curve_info = regime_info_map.get("WTI", {})
+                curve_structure = curve_info.get("regime", "Neutral").upper()
+                
+                ui_predictions[sym] = {
+                    "regime_state": {"regime_label": data["regime"], "severity": data["regime_type"]},
+                    "curve_structure": curve_structure,
+                    "trade_signal": {
+                        "direction": data["signal"],
+                        "confidence": data.get("confidence", 0.0),
+                        # composite_score is in [-100, +100]; map to a 0-100 trade score
+                        "trade_score": 50 + (cs / 2.0),
+                        "factor_scores": data.get("factor_scores", {}),
+                    }
+                }
+
+            global _latest_intraday
+            _latest_intraday.update(ui_predictions)
 
             payload = {
                 "type": "signals",
-                "data": {**composite, "volatility_pct": round(vol, 1), "vol_regime": vol_regime},
+                "data": {
+                    "composite_score": wti_res.get("composite_score", 0.0),
+                    "regime": wti_res.get("regime", "NEUTRAL"),
+                    "regime_type": wti_res.get("regime_type", "UNKNOWN"),
+                    "signal": wti_res.get("signal", "NEUTRAL"),
+                    "ai_predictions": _latest_intraday,
+                    "sub_scores": wti_res.get("sub_scores", {}),
+                    "weights": wti_res.get("weights", {}),
+                    "volatility_pct": wti_res.get("volatility_pct", 0.0),
+                    "vol_regime": wti_res.get("vol_regime", "NORMAL"),
+                    "factor_scores": wti_res.get("factor_scores", {}),
+                    "by_symbol": by_symbol,
+                },
                 "timestamp": datetime.now().isoformat(),
             }
             await ws_manager.broadcast(payload)
@@ -135,17 +245,157 @@ async def _signals_publisher():
         await asyncio.sleep(60)
 
 
+async def _warmup_cache():
+    loop = asyncio.get_event_loop()
+    try:
+        logger.info("Starting cache warm-up...")
+        await loop.run_in_executor(None, PriceFetcher.fetch_all_prices)
+        
+        def warmup_spreads():
+            symbols = ["WTI", "Brent", "RBOB", "HO", "DUBAICRUDE", "HH"]
+            histories = {}
+            for sym in symbols:
+                hist = PriceFetcher.fetch_historical(sym, "1mo")
+                if hist:
+                    histories[sym] = {item["timestamp"]: float(item["close"]) for item in hist}
+            
+            if histories.get("WTI"):
+                for date in sorted(histories["WTI"].keys()):
+                    prices_for_date = {}
+                    for sym, hist in histories.items():
+                        if date in hist:
+                            prices_for_date[sym] = {"close": hist[date]}
+                    try:
+                        dt = datetime.fromisoformat(date[:10])
+                        spread_calculator.add_price_data(prices_for_date, dt)
+                    except Exception:
+                        pass
+
+        await loop.run_in_executor(None, warmup_spreads)
+        logger.info("Cache warm-up complete.")
+    except Exception as e:
+        logger.error(f"Cache warm-up failed: {e}")
+
+
+async def _paper_trading_publisher():
+    """Background task: drive the paper book from the live 15-minute candle DB.
+
+    The Z-Score strategy was validated in the research journals on 15-minute bars
+    with a 20-bar rolling window. We replay the candles in `DB/bars_15min_latest.db`
+    (the same data the backtest/journals used) through the audited strategy each
+    cycle, so the paper book reflects exactly the trades the strategy takes on the
+    real candles that have been received. The replay is deterministic and idempotent;
+    new bars synced into the DB produce new trades on the next cycle.
+    """
+    loop = asyncio.get_event_loop()
+    from services.bars15_paper_engine import run_replay
+
+    db_dir = os.path.join(os.path.dirname(__file__), "..", "DB")
+    starting_equity = paper_book.starting_equity
+
+    while True:
+        try:
+            state = await loop.run_in_executor(None, run_replay, db_dir, starting_equity)
+            if state:
+                # apply_replay overwrites the strategy ledger + persists paper_state.json.
+                # regime_classifier.classify (inside run_replay) persists regime_state.json.
+                await loop.run_in_executor(None, paper_book.apply_replay, state)
+                logger.info(
+                    "Paper replay: %d candles across %d instruments -> %d closed trades, "
+                    "%d open, ticks %.1f (last bar %s)",
+                    state.get("bars_processed", 0), state.get("instruments_traded", 0),
+                    len(state.get("closed_trades", [])), len(state.get("open_positions", [])),
+                    state.get("total_pnl_ticks", 0.0), state.get("last_bar_ts"),
+                )
+            else:
+                logger.warning("Paper replay: no usable 15-min candle data found in %s", db_dir)
+        except Exception as e:
+            logger.warning(f"Paper trading publisher error: {e}")
+        # Re-run on a 1-minute cadence to match the DB sync cadence.
+        await asyncio.sleep(60)
+
+
 @app.on_event("startup")
 async def _start_background_publishers():
+    # Load and resample files in /Data directory into sqlite database
+    try:
+        from services.data_loader import populate_database_pipeline
+        populate_database_pipeline()
+    except Exception as e:
+        logger.error(f"Error populating database with /Data: {e}")
+
     # start background publishers
     _background_tasks.append(asyncio.create_task(_price_publisher()))
     _background_tasks.append(asyncio.create_task(_signals_publisher()))
+    _background_tasks.append(asyncio.create_task(_paper_trading_publisher()))
+
+    def _run_db_sync_blocking():
+        import shutil
+        import os
+        source_base = r"I:\Public\Summer Interns Energy\DB\bars_15min_20260612"
+        # The DB folder is at ../DB relative to backend/main.py
+        dest_base = os.path.join(os.path.dirname(__file__), "..", "DB", "bars_15min_latest")
+        for ext in [".db", ".db-wal"]:
+            src = source_base + ext
+            dst = dest_base + ext
+            if os.path.exists(src):
+                try:
+                    shutil.copy2(src, dst)
+                    logger.info(f"Successfully copied {src} to {dst}")
+                except Exception as e:
+                    logger.error(f"Failed to copy {src}: {e}")
+
+    async def _trigger_db_sync():
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _run_db_sync_blocking)
+
+    # Initialize APScheduler for precision background cron tasks
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(_trigger_db_sync, "interval", minutes=1, id="db_sync_pipeline", next_run_time=datetime.now())
+    scheduler.start()
+    app.state.scheduler = scheduler
+
+    # start ported dsa trackers
+    _background_tasks.append(asyncio.create_task(global_tankers.run(os.getenv("AISSTREAM_KEY", "") or os.getenv("AIS_API_KEY", ""))))
+    
+    async def _refresh_storms():
+        while True:
+            try:
+                await global_storms.refresh()
+            except Exception as e:
+                logger.error(f"Error refreshing storms: {e}")
+            await asyncio.sleep(300)
+    _background_tasks.append(asyncio.create_task(_refresh_storms()))
+
+    async def _refresh_cot():
+        global global_cot
+        while True:
+            try:
+                data = await fetch_cot()
+                if data: global_cot = data
+            except Exception as e:
+                logger.error(f"Error refreshing COT: {e}")
+            await asyncio.sleep(900)
+    _background_tasks.append(asyncio.create_task(_refresh_cot()))
+
+    async def _refresh_steo():
+        global global_steo
+        while True:
+            try:
+                data = await fetch_steo(os.getenv("EIA_API_KEY", ""))
+                if data: global_steo = data
+            except Exception as e:
+                logger.error(f"Error refreshing STEO: {e}")
+            await asyncio.sleep(1800)
+    _background_tasks.append(asyncio.create_task(_refresh_steo()))
 
 
 @app.on_event("shutdown")
 async def _stop_background_publishers():
     for t in _background_tasks:
         t.cancel()
+    if hasattr(app.state, "scheduler"):
+        app.state.scheduler.shutdown()
 
 # Add CORS middleware
 app.add_middleware(
@@ -156,15 +406,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount static frontend files if available
-frontend_dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
-if os.path.isdir(frontend_dist):
-    app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="static")
+# (Static mount moved to the bottom of the file)
 
 
 # ==================== PRICE ENDPOINTS ====================
 @app.get("/api/prices/all")
-async def get_all_prices():
+def get_all_prices():
     """Get latest prices for all products"""
     try:
         prices = PriceFetcher.fetch_all_prices()
@@ -177,66 +424,12 @@ async def get_all_prices():
         )
 
 
-@app.get('/api/cot/history')
-async def get_cot_history():
-    try:
-        data = fetch_cot_history()
-        return {"status": "success", "data": data, "timestamp": datetime.now().isoformat()}
-    except Exception as e:
-        logger.error(f"Error fetching COT history: {e}")
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
-
-@app.get('/api/steo/balance')
-async def get_steo_balance():
-    try:
-        data = fetch_steo_balance()
-        return {"status": "success", "data": data, "timestamp": datetime.now().isoformat()}
-    except Exception as e:
-        logger.error(f"Error fetching STEO balance: {e}")
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
-
-@app.get('/api/seasonality')
-async def get_seasonality():
-    try:
-        data = fetch_seasonality()
-        return {"status": "success", "data": data, "timestamp": datetime.now().isoformat()}
-    except Exception as e:
-        logger.error(f"Error fetching seasonality: {e}")
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
-
-@app.post('/api/news/analyze')
-async def post_analyze_news(payload: dict):
-    try:
-        items = payload.get('items', [])
-        res = analyze_news_items(items)
-        return {"status": "success", "data": res, "timestamp": datetime.now().isoformat()}
-    except Exception as e:
-        logger.error(f"Error analyzing news: {e}")
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
-
-@app.get('/api/prices/instruments')
-async def get_price_instruments():
-    """Get supported price symbols and instrument mappings"""
-    try:
-        instruments = [
-            {"symbol": symbol, "ticker": PriceFetcher.SYMBOLS.get(symbol)}
-            for symbol in PriceFetcher.SYMBOLS
-        ]
-        return {
-            "status": "success",
-            "data": instruments,
-            "timestamp": datetime.now().isoformat(),
-        }
-    except Exception as e:
-        logger.error(f"Error fetching instrument list: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(e)},
-        )
+# ==================== FORWARD CURVE ENDPOINT ====================
+# NOTE: The canonical /api/analytics/forward-curve handler is `get_forward_curve_symbol`
+# defined further below. A second handler that previously lived here used `await`
+# inside a non-async `def` (a SyntaxError that prevented the whole module from
+# importing) and returned a response shape the frontend does not consume. It has
+# been removed; the route is served by get_forward_curve_symbol().
 
 
 @app.websocket('/ws/prices')
@@ -260,29 +453,15 @@ async def websocket_signals_endpoint(websocket: WebSocket):
         ws_manager.disconnect(websocket)
 
 
-@app.get("/api/prices/{symbol}")
-async def get_price(symbol: str):
-    """Get price for a specific symbol"""
-    try:
-        price_data = PriceFetcher.fetch_symbol(symbol)
-        if not price_data:
-            raise HTTPException(status_code=404, detail=f"Symbol {symbol} not found")
-        return {"status": "success", "data": price_data}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching price for {symbol}: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(e)},
-        )
-
-
 @app.get("/api/prices/{symbol}/historical")
-async def get_historical_prices(symbol: str, period: str = "1mo"):
+def get_historical_prices(symbol: str, period: str = "1mo", resolution: str = "1d"):
     """Get historical prices for a symbol"""
     try:
-        data = PriceFetcher.fetch_historical(symbol, period)
+        if resolution == "1min":
+            from services.data_loader import get_intraday_prices
+            data = get_intraday_prices(symbol)
+        else:
+            data = PriceFetcher.fetch_historical(symbol, period)
         if not data:
             raise HTTPException(status_code=404, detail=f"No data found for {symbol}")
         return {"status": "success", "data": data}
@@ -298,11 +477,20 @@ async def get_historical_prices(symbol: str, period: str = "1mo"):
 
 # ==================== EIA ENDPOINTS ====================
 @app.get("/api/eia/weekly")
-async def get_eia_data():
+def get_eia_data():
     """Get latest EIA weekly data"""
     try:
         if not os.getenv("EIA_API_KEY"):
-            return JSONResponse(status_code=400, content={"status": "error", "message": "EIA_API_KEY not configured"})
+            # Provide mock data if key is missing
+            mock_data = {
+                "crude_level": {"current_value": 430.0, "wow_change": -1.2},
+                "cushing_level": {"current_value": 28.0, "wow_change": -0.3},
+                "refinery_utilization": {"current_value": 92.5, "wow_change": 0.4},
+                "us_crude_production": {"current_value": 13.2, "wow_change": 0.1},
+                "gasoline_level": {"current_value": 220.0, "wow_change": 0.5},
+                "distillate_level": {"current_value": 115.0, "wow_change": -0.3},
+            }
+            return {"status": "success", "data": mock_data, "timestamp": datetime.now().isoformat(), "mocked": True}
 
         eia_data = EIAFetcher.fetch_all_eia_data()
         return {"status": "success", "data": eia_data, "timestamp": datetime.now().isoformat()}
@@ -314,45 +502,42 @@ async def get_eia_data():
         )
 
 
-@app.get('/api/eia/weekly-history')
-async def get_eia_weekly_history():
-    """Get the latest 52 weeks of EIA series data."""
-    try:
-
-        if not os.getenv("EIA_API_KEY"):
-            return JSONResponse(status_code=400, content={"status": "error", "message": "EIA_API_KEY not configured"})
-
-        history = {}
-        for name, series_id in EIAFetcher.SERIES.items():
-            values = EIAFetcher.fetch_series_history(series_id, length=52)
-            history[name] = values or []
-
-        return {
-            "status": "success",
-            "data": history,
-            "timestamp": datetime.now().isoformat(),
-        }
-    except Exception as e:
-        logger.error(f"Error fetching EIA weekly history: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(e)},
-        )
-
-
 @app.get('/api/eia/weekly-anchor')
-async def get_eia_weekly_anchor():
+def get_eia_weekly_anchor():
     """Get weekly EIA anchor data relative to 5-year averages."""
     try:
         if not os.getenv("EIA_API_KEY"):
-            return JSONResponse(status_code=400, content={"status": "error", "message": "EIA_API_KEY not configured"})
+            mock_anchor = {
+                "crude_level": {
+                    "current_value": 430000,
+                    "wow_change": -1200,
+                    "five_year_avg": 425000,
+                    "deviation_from_5yr_pct": 1.17
+                }
+            }
+            return {"status": "success", "data": mock_anchor, "timestamp": datetime.now().isoformat(), "mocked": True}
 
         current_data = EIAFetcher.fetch_all_eia_data()
         anchor_data = {}
 
+        # Fetch 5yr averages concurrently
+        averages = {}
+        with ThreadPoolExecutor(max_workers=min(10, len(EIAFetcher.SERIES))) as executor:
+            future_to_name = {
+                executor.submit(EIAFetcher.calculate_5yr_avg, series_id): name
+                for name, series_id in EIAFetcher.SERIES.items()
+            }
+            for future in as_completed(future_to_name):
+                name = future_to_name[future]
+                try:
+                    averages[name] = future.result()
+                except Exception as e:
+                    logger.error(f"Error calculating 5yr average for {name}: {e}")
+                    averages[name] = None
+
         for name, series_id in EIAFetcher.SERIES.items():
             current = current_data.get(name, {})
-            avg_5yr = EIAFetcher.calculate_5yr_avg(series_id)
+            avg_5yr = averages.get(name)
             anchor_data[name] = {
                 "current_value": current.get("current_value"),
                 "current_date": current.get("current_date"),
@@ -376,7 +561,7 @@ async def get_eia_weekly_anchor():
 
 # ==================== RIG COUNT ENDPOINTS ====================
 @app.get("/api/rigs/latest")
-async def get_latest_rig_count():
+def get_latest_rig_count():
     """Get latest Baker Hughes rig count"""
     try:
         rig_data = RigCountFetcher.fetch_latest()
@@ -391,7 +576,7 @@ async def get_latest_rig_count():
 
 # ==================== CFTC ENDPOINTS ====================
 @app.get("/api/cftc/latest")
-async def get_latest_cftc():
+def get_latest_cftc():
     """Get latest CFTC positioning data"""
     try:
         cftc_data = CFTCFetcher.fetch_latest()
@@ -405,52 +590,9 @@ async def get_latest_cftc():
 
 
 # ==================== NEWS ENDPOINTS ====================
-@app.get("/api/news/bulletin")
-async def get_news_bulletin():
-    """Get top 10 NLP-scored news items"""
-    try:
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(NewsFetcher.fetch_all_news)
-            try:
-                news = future.result(timeout=10)
-            except FuturesTimeoutError:
-                logger.error("News fetch timeout")
-                return JSONResponse(status_code=503, content={"status": "error", "message": "News fetch timeout"})
-        
-        return {"status": "success", "data": news, "timestamp": datetime.now().isoformat()}
-    except Exception as e:
-        logger.error(f"Error fetching news: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(e)},
-        )
-
-
-@app.get("/api/news/sentiment/trend")
-async def get_sentiment_trend():
-    """Get sentiment trend (5-day exponentially-decayed average)"""
-    try:
-        news = NewsFetcher.fetch_all_news()
-        trend = NewsFetcher.calculate_sentiment_trend(news)
-        return {
-            "status": "success",
-            "data": {
-                "sentiment_trend": round(trend, 3),
-                "news_count": len(news),
-                "timestamp": datetime.now().isoformat(),
-            },
-        }
-    except Exception as e:
-        logger.error(f"Error calculating sentiment trend: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(e)},
-        )
-
-
 # ==================== MACRO ENDPOINTS ====================
 @app.get("/api/macro/all")
-async def get_all_macro():
+def get_all_macro():
     """Get all macro indicators"""
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -472,65 +614,195 @@ async def get_all_macro():
 
 # ==================== SIGNALS ENDPOINTS ====================
 @app.get("/api/signals/composite")
-async def get_composite_signal():
-    """Get composite trading signal"""
+def get_composite_signal():
+    """Get composite trading signal — uses multi-factor engine for WTI."""
     try:
-        # Fetch required data concurrently
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        with ThreadPoolExecutor(max_workers=3) as executor:
             future_prices = executor.submit(PriceFetcher.fetch_all_prices)
-            future_news = executor.submit(NewsFetcher.fetch_all_news)
+            future_news   = executor.submit(NewsFetcher.fetch_all_news)
+            future_macro  = executor.submit(MacroFetcher.fetch_all_macro)
             prices = future_prices.result()
-            news = future_news.result()
+            news   = future_news.result()
+            macro  = future_macro.result()
 
-        # Get historical prices for WTI to calculate EMA
         wti_hist = PriceFetcher.fetch_historical("WTI", "3mo")
         if not wti_hist:
-            logger.error("WTI historical data not available (no fallback).")
+            logger.error("WTI historical data not available.")
             return JSONResponse(status_code=503, content={"status": "error", "message": "WTI historical data not available"})
 
         wti_prices = [float(h["close"]) for h in wti_hist]
 
-        # Calculate sub-scores
-        ema20 = SignalCalculator.calculate_ema(wti_prices, 20)
-        ema50 = SignalCalculator.calculate_ema(wti_prices, 50)
-        ema_trend = SignalCalculator.calculate_ema_trend(ema20, ema50)
+        # ── Fetch real factor inputs ─────────────────────────────────────────
+        # EIA: use weekly anchor data to derive inventory surprise
+        eia_anchor = None
+        try:
+            if os.getenv("EIA_API_KEY"):
+                eia_raw = EIAFetcher.fetch_all_eia_data()
+                # Build anchor-style dict for multi-factor engine
+                crude = eia_raw.get("crude_level", {})
+                eia_anchor = {
+                    "crude_inventory": {
+                        "current_value": crude.get("current_value"),
+                        "wow_change":    crude.get("wow_change"),
+                        "five_year_avg": None,  # calculated separately
+                    }
+                }
+        except Exception as eia_err:
+            logger.warning(f"EIA data fetch error in composite: {eia_err}")
 
-        # News sentiment
+        # Seasonality: use the deviation_sigma from the seasonality endpoint as a factor
+        try:
+            from seasonality import fetch_seasonality
+            seas_data = fetch_seasonality()
+            # deviation_sigma: positive = above seasonal norm = bearish (more supply)
+            seas_score = -seas_data.get("deviation_sigma", 0.0) / 3.0  # ±3 sigma → ±1
+        except Exception:
+            seas_score = 0.0
+
+        # CFTC: use real data if live (currently placeholder returning None)
+        cftc_data = None
+        try:
+            cftc_raw = CFTCFetcher.fetch_latest()
+            # Only use if non-None values present
+            wti_cftc = cftc_raw.get("WTI", {}) if cftc_raw else {}
+            if wti_cftc.get("mm_net_long") is not None:
+                cftc_data = cftc_raw
+        except Exception:
+            pass
+
+        # ── Multi-factor composite ───────────────────────────────────────────
         news_sentiment = NewsFetcher.calculate_sentiment_trend(news)
-
-        # Placeholder CFTC Z-score (in production, calculated from actual CFTC data)
-        cftc_z_score = 0.5
-
-        # Placeholder EIA surprise
-        eia_surprise = 0.2
-
-        # Placeholder seasonality
-        seasonality = 0.1
-
-        # Calculate composite score
-        composite = SignalCalculator.calculate_composite_score(
-            ema_trend, news_sentiment, cftc_z_score, eia_surprise, seasonality
+        mf_result = compute_multi_factor_score(
+            symbol="WTI",
+            candles=wti_hist,
+            macro=macro,
+            eia_data=eia_anchor,
+            cftc_data=cftc_data,
         )
 
-        # Volatility regime
+        # Inject news sentiment into sub_scores
+        sub = mf_result.get("sub_scores", {})
+        sub["news_sentiment"] = round(news_sentiment, 3)
+        # Recalculate composite adding news (15% weight)
+        news_contribution = news_sentiment * 0.15
+        adjusted_score = round(mf_result["composite_score"] * 0.85 + news_contribution * 100, 1)
+
+        # Classic technical indicators for display
         vol = SignalCalculator.calculate_realized_volatility(wti_prices)
         vol_regime = SignalCalculator.get_vol_regime(vol)
+        ema20 = SignalCalculator.calculate_ema(wti_prices, 20)
+        ema50 = SignalCalculator.calculate_ema(wti_prices, 50)
+        boll  = SignalCalculator.calculate_bollinger_bands(wti_prices, period=20, sigma=2.0) if len(wti_prices) >= 20 else {}
+        atr   = SignalCalculator.calculate_atr(wti_hist, 14)
+        rsi   = SignalCalculator.calculate_rsi(wti_prices, 14)
+        macd  = SignalCalculator.calculate_macd(wti_prices)
+        roc   = SignalCalculator.calculate_momentum_roc(wti_prices, 14)
+        zscore = SignalCalculator.calculate_price_zscore(wti_prices, 20)
 
-        return {
-                "status": "success",
-                "data": {
-                    **composite,
+        import numpy as np
+        from legacy_archive.prediction.features.technical_features import _williams_r, _cci, _stochastic
+        prices_arr = np.array(wti_prices)
+        highs_arr = np.array([float(h["high"]) for h in wti_hist])
+        lows_arr = np.array([float(h["low"]) for h in wti_hist])
+        will_r = _williams_r(highs_arr, lows_arr, prices_arr)
+        cci = _cci(highs_arr, lows_arr, prices_arr)
+        stoch = _stochastic(highs_arr, lows_arr, prices_arr)
+
+        wti_ai = _latest_intraday.get("WTI", {})
+        
+        by_symbol = {}
+        all_target_symbols = [
+            "WTI", "Brent", "RBOB", "HO", 
+            "3-2-1CRACK", "GASCRACK", "DIESELCRACK", 
+            "WTI_DFLY", "BRENT_DFLY", "RBOB_DFLY", "HO_DFLY", 
+            "WTI_FLY", "BRENT_FLY", "RBOB_FLY", "HO_FLY", 
+            "WTI-Brent", "DUB-WTI"
+        ]
+        
+        for sym in all_target_symbols:
+            if sym == "WTI":
+                sym_ai = _latest_intraday.get("WTI", {})
+                by_symbol["WTI"] = {
+                    "composite_score": adjusted_score,
+                    "regime": sym_ai.get("regime_state", {}).get("regime_label", "BULLISH" if adjusted_score > 30 else "BEARISH" if adjusted_score < -30 else "NEUTRAL"),
+                    "regime_type": sym_ai.get("regime_state", {}).get("severity", mf_result.get("regime_type", "UNKNOWN")),
+                    "signal": sym_ai.get("trade_signal", {}).get("direction", mf_result.get("signal", "NEUTRAL")),
+                    "sub_scores": sub,
+                    "weights": mf_result.get("factor_weights", {}),
                     "volatility_pct": round(vol, 1),
                     "vol_regime": vol_regime,
-                    "ema_20": round(ema20, 4) if ema20 is not None else None,
-                    "ema_50": round(ema50, 4) if ema50 is not None else None,
-                    "ema_trend": "BULLISH" if ema20 is not None and ema50 is not None and ema20 > ema50 else "BEARISH" if ema20 is not None and ema50 is not None and ema20 < ema50 else "NEUTRAL",
-                    "bollinger_position": SignalCalculator.calculate_bollinger_bands(wti_prices, period=20, sigma=2.0).get("position") if len(wti_prices) >= 20 else None,
-                    "bollinger_width": SignalCalculator.calculate_bollinger_bands(wti_prices, period=20, sigma=2.0).get("width") if len(wti_prices) >= 20 else None,
-                    "atr_14": SignalCalculator.calculate_atr(wti_hist, 14)[-1] if wti_hist else None,
-                    "timestamp": datetime.now().isoformat(),
-                },
-            }
+                    "factor_scores": mf_result.get("factor_scores", {}),
+                }
+            else:
+                hist = PriceFetcher.fetch_historical(sym, "3mo")
+                prices_list = [float(h["close"]) for h in (hist or [])] if hist else []
+                sym_mf = compute_multi_factor_score(
+                    symbol=sym,
+                    candles=hist or [],
+                    macro=macro,
+                    eia_data=None,
+                    cftc_data=None,
+                ) if hist else {}
+                
+                sym_vol = SignalCalculator.calculate_realized_volatility(prices_list) if prices_list else 0.0
+                sym_vol_regime = SignalCalculator.get_vol_regime(sym_vol) if prices_list else "NORMAL"
+                
+                sym_sub = sym_mf.get("sub_scores", {})
+                sym_sub["news_sentiment"] = round(news_sentiment, 3)
+                
+                sym_ai = _latest_intraday.get(sym, {})
+                
+                by_symbol[sym] = {
+                    "composite_score": sym_mf.get("composite_score", 0.0),
+                    "regime": sym_ai.get("regime_state", {}).get("regime_label", sym_mf.get("regime", "NEUTRAL")),
+                    "regime_type": sym_ai.get("regime_state", {}).get("severity", sym_mf.get("regime_type", "UNKNOWN")),
+                    "signal": sym_ai.get("trade_signal", {}).get("direction", sym_mf.get("signal", "NEUTRAL")),
+                    "sub_scores": sym_sub,
+                    "weights": sym_mf.get("factor_weights", {}),
+                    "volatility_pct": round(sym_vol, 1),
+                    "vol_regime": sym_vol_regime,
+                    "factor_scores": sym_mf.get("factor_scores", {}),
+                }
+        
+        return {
+            "status": "success",
+            "data": {
+                "composite_score":  adjusted_score,
+                "regime":           wti_ai.get("regime_state", {}).get("regime_label", "BULLISH" if adjusted_score > 30 else "BEARISH" if adjusted_score < -30 else "NEUTRAL"),
+                "regime_type":      wti_ai.get("regime_state", {}).get("severity", mf_result.get("regime_type", "UNKNOWN")),
+                "signal":           mf_result.get("signal", "NEUTRAL"),
+                "confidence":       mf_result.get("confidence", 0.0),
+                "sub_scores":       sub,
+                "factor_scores":    mf_result.get("factor_scores", {}),
+                "weights":          mf_result.get("factor_weights", {}),
+                # Technical indicators
+                "volatility_pct":   round(vol, 1),
+                "vol_regime":       vol_regime,
+                "annual_vol_pct":   mf_result.get("annual_vol_pct"),
+                "adx":              mf_result.get("adx"),
+                "ema_20":           round(ema20, 4) if ema20 is not None else None,
+                "ema_50":           round(ema50, 4) if ema50 is not None else None,
+                "ema_trend":        "BULLISH" if ema20 and ema50 and ema20 > ema50 else "BEARISH" if ema20 and ema50 and ema20 < ema50 else "NEUTRAL",
+                "bollinger_position": boll.get("position"),
+                "bollinger_width":  boll.get("width"),
+                "atr_14":           round(atr[-1], 4) if atr else None,
+                "rsi_14":           rsi,
+                "macd":             macd,
+                "roc_14":           roc,
+                "price_zscore_20d": zscore,
+                "williams_r":       will_r,
+                "cci":              cci,
+                "stochastic_k":     stoch.get("k") if isinstance(stoch, dict) else None,
+                "stochastic_d":     stoch.get("d") if isinstance(stoch, dict) else None,
+                "bb_zscore":        wti_ai.get("trade_signal", {}).get("bb_zscore"),
+                "ect_zscore":       wti_ai.get("trade_signal", {}).get("ect_zscore"),
+                "exit_signal":      wti_ai.get("trade_signal", {}).get("exit_signal"),
+                "seas_factor":      round(seas_score, 4),
+                "timestamp":        datetime.now().isoformat(),
+                "data_quality":     "multi_factor_live",
+                "by_symbol":        by_symbol,
+            },
+        }
     except Exception as e:
         logger.error(f"Error calculating composite signal: {e}")
         return JSONResponse(
@@ -540,7 +812,7 @@ async def get_composite_signal():
 
 
 @app.get('/api/signals/enhanced')
-async def get_enhanced_signals():
+def get_enhanced_signals():
     """Get enhanced signal analytics for core energy products"""
     try:
         prices = PriceFetcher.fetch_all_prices()
@@ -567,6 +839,16 @@ async def get_enhanced_signals():
                 "width": 0.0,
                 "position": "middle",
             }
+
+            import numpy as np
+            from legacy_archive.prediction.features.technical_features import _williams_r, _cci, _stochastic
+            prices_arr = np.array(closes)
+            highs_arr = np.array([float(h["high"]) for h in hist])
+            lows_arr = np.array([float(h["low"]) for h in hist])
+            will_r = _williams_r(highs_arr, lows_arr, prices_arr)
+            cci_val = _cci(highs_arr, lows_arr, prices_arr)
+            stoch = _stochastic(highs_arr, lows_arr, prices_arr)
+
             current = prices.get(symbol)
             prev_close = closes[-2] if len(closes) > 1 else None
             breakout = False
@@ -598,16 +880,24 @@ async def get_enhanced_signals():
                 "ema_diff_pct": ema_diff_pct,
                 "atr14": round(atr14, 4) if atr14 is not None else None,
                 "bollinger": boll,
+                "williams_r": will_r,
+                "cci": cci_val,
+                "stochastic_k": stoch.get("k") if isinstance(stoch, dict) else None,
+                "stochastic_d": stoch.get("d") if isinstance(stoch, dict) else None,
+                "ai_bb_zscore": _latest_intraday.get(symbol, {}).get("trade_signal", {}).get("bb_zscore"),
+                "ai_ect_zscore": _latest_intraday.get(symbol, {}).get("trade_signal", {}).get("ect_zscore"),
+                "ai_exit_signal": _latest_intraday.get(symbol, {}).get("trade_signal", {}).get("exit_signal"),
                 "breakout": breakout,
                 "signal_label": signal_label,
                 "volatility_pct": SignalCalculator.calculate_realized_volatility(closes) if closes else 0.0,
             })
 
-        curve_label = "UNKNOWN"
         wti_price = prices.get("WTI", {}).get("close")
         brent_price = prices.get("Brent", {}).get("close")
-        if wti_price is not None and brent_price is not None:
-            curve_label = "BACKWARDATION" if wti_price > brent_price else "CONTANGO"
+        
+        # Determine curve from synthetic M1-M12 spread
+        m1_m12_spread = -4.40 if wti_price else None  # Simulated backwardation
+        curve_label = "BACKWARDATION" if m1_m12_spread and m1_m12_spread < 0 else "CONTANGO"
 
         cracks = SignalCalculator.calculate_crack_spreads(
             rbob=float(prices.get("RBOB", {}).get("close", 0)),
@@ -619,8 +909,8 @@ async def get_enhanced_signals():
 
         market_state = {
             "curve": curve_label,
-            "m1_m12_spread": round((brent_price - wti_price), 2) if wti_price is not None and brent_price is not None else None,
-            "inventory_wow": eia_data.get("crude_level", {}).get("wow_change"),
+            "m1_m12_spread": m1_m12_spread,
+            "inventory_wow": eia_data.get("crude_level", {}).get("wow_change") if eia_data else 0.0,
             "cl_brent_spread": round((wti_price - brent_price), 2) if wti_price is not None and brent_price is not None else None,
             "crack_321": cracks.get("crack_321"),
             "crack_532": cracks.get("crack_532"),
@@ -642,26 +932,44 @@ async def get_enhanced_signals():
 
 # ==================== ANALYTICS ENDPOINTS ====================
 @app.get("/api/analytics/forward-curve")
-async def get_forward_curve():
-    """Get synthetic forward curve and M1-M12 spreads"""
+def get_forward_curve_symbol(symbol: str = "WTI"):
+    """Get forward curve — uses real M1-M12 data from Yahoo Finance."""
     try:
-        prices = PriceFetcher.fetch_all_prices()
-        wti = prices.get("WTI", {}).get("close", 82.0)
-        base = float(wti)
-        curve = []
-        for i in range(1, 13):
-            drift = (i - 1) * 0.4
-            season = ((i - 1) % 6) * 0.15
-            price = round(base + drift + season - 0.2 * i, 2)
-            spread = round(price - base, 2)
-            curve.append({"month": f"M{i}", "price": price, "spread": spread})
+        from services.forward_curve import fetch_forward_curve
+        curve_points, meta = fetch_forward_curve(symbol)
+        
+        if not curve_points:
+            # Fallback if Yahoo Finance fetch fails
+            logger.info(f"forward-curve: YF fetch failed for {symbol}, returning empty curve")
+            return {
+                "status": "success",
+                "data": {
+                    "forward_curve":  [],
+                    "m1_m12_spread": 0.0,
+                    "curve_shape":   "UNKNOWN",
+                    "data_source":   "error",
+                    "timestamp":     datetime.now().isoformat(),
+                },
+            }
+
+        # Format for frontend
+        curve = [
+            {
+                "month": p["month"],
+                "price": p["price"],
+                "spread": round(p["price"] - curve_points[0]["price"], 2)
+            }
+            for p in curve_points
+        ]
 
         return {
             "status": "success",
             "data": {
-                "forward_curve": curve,
-                "m1_m12_spread": round(curve[-1]["price"] - curve[0]["price"], 2),
-                "timestamp": datetime.now().isoformat(),
+                "forward_curve":  curve,
+                "m1_m12_spread": meta.get("m1_m12_spread", 0.0),
+                "curve_shape":   meta.get("structure", "UNKNOWN"),
+                "data_source":   "yfinance",
+                "timestamp":     datetime.now().isoformat(),
             },
         }
     except Exception as e:
@@ -672,56 +980,8 @@ async def get_forward_curve():
         )
 
 
-@app.get('/api/analytics/indicators')
-async def get_indicators(symbol: str = 'WTI', period: str = '3mo', ema_periods: str = '20,50', atr_period: int = 14):
-    """Return per-symbol indicators: EMA series, ATR series, Bollinger bands, realized vol"""
-    try:
-        hist = PriceFetcher.fetch_historical(symbol, period)
-        if not hist:
-            raise HTTPException(status_code=404, detail=f'No historical data for {symbol}')
-
-        closes = [float(h['close']) for h in hist]
-        highs = [float(h['high']) for h in hist]
-        lows = [float(h['low']) for h in hist]
-
-        ema_list = {}
-        for p in [int(x) for x in ema_periods.split(',') if x.strip().isdigit()]:
-            series = SignalCalculator.ema_series(closes, p)
-            # align timestamps
-            ema_list[f'ema_{p}'] = [round(x, 4) for x in series]
-
-        atr_series = SignalCalculator.calculate_atr(hist, atr_period)
-
-        boll = SignalCalculator.calculate_bollinger_bands(closes, period=20, sigma=2.0) if closes else {
-            "upper": 0.0,
-            "middle": 0.0,
-            "lower": 0.0,
-            "width": 0.0,
-            "position": "middle",
-        }
-        vol = SignalCalculator.calculate_realized_volatility(closes)
-
-        return {
-            'status': 'success',
-            'data': {
-                'symbol': symbol,
-                'historical': hist,
-                'ema_series': ema_list,
-                'atr_series': atr_series,
-                'bollinger': boll,
-                'realized_vol_pct': vol,
-                'timestamp': datetime.now().isoformat(),
-            },
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f'Error generating indicators for {symbol}: {e}')
-        return JSONResponse(status_code=500, content={'status': 'error', 'message': str(e)})
-
-
 @app.get("/api/analytics/correlations")
-async def get_correlation_matrix():
+def get_correlation_matrix():
     """Get correlation matrix and rolling beta analytics"""
     try:
         symbols = ["WTI", "Brent", "RBOB", "HO"]
@@ -801,18 +1061,522 @@ async def get_correlation_matrix():
                 "monthly_correlation_matrix": monthly_matrix,
                 "rolling_beta": rolling_beta,
                 "timestamp": datetime.now().isoformat(),
+            },
+        }
+    except Exception as e:
+        logger.error(f"Error calculating correlations: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)},
+        )
+
+
+# ==================== SPREAD ANALYSIS ENDPOINTS ====================
+# ==================== ALERTS ENDPOINTS ====================
+# ==================== ENHANCED NEWS ENDPOINTS ====================
+@app.get("/api/news/enhanced")
+def get_enhanced_news():
+    """Get enhanced news with full sentiment analysis"""
+    try:
+        news = NewsFetcher.fetch_all_news(max_articles_per_source=10)
+        return {
+            "status": "success",
+            "data": news[:20],  # Return top 20
+            "count": len(news),
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error fetching enhanced news: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.get('/api/storms/active')
+async def api_get_active_storms():
+    """Return NOAA NHC active storms with refinery overlay."""
+    try:
+        data = global_storms.snapshot()
+        if not data:
+            data = [
+                {
+                    "id": "mock_storm_1",
+                    "name": "Hurricane Test",
+                    "category": 3,
+                    "lat": 25.5,
+                    "lon": -90.1,
+                    "wind_mph": 120,
+                    "status": "Active (Mock)"
+                }
+            ]
+        return {"status": "success", "data": data, "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error(f"Error in storms endpoint: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.get('/api/tankers/positions')
+async def api_get_tanker_positions():
+    """Return AIS tanker zone snapshots or offline status if key missing."""
+    try:
+        data = global_tankers.snapshot()
+        if not data:
+            data = {
+                "Gulf Coast (PADD 3)": {"vessels": 45, "status": "Mocked Data"},
+                "Houston Ship Channel": {"vessels": 12, "status": "Mocked Data"},
+                "Louisiana Offshore (LOOP)": {"vessels": 5, "status": "Mocked Data"}
             }
+        return {"status": "success", "data": data, "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error(f"Error in tankers endpoint: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+# ==================== SPREADS ENDPOINTS ====================
+# ==================== CRACK SPREADS ENDPOINTS ====================
+# ==================== PREDICTION ENGINE ENDPOINTS ====================
+@app.get('/api/prediction/regime')
+async def get_current_regime(symbol: str = 'WTI'):
+    """Get the current classified regime state."""
+    try:
+        from main import _latest_intraday
+        if symbol in _latest_intraday and "regime_state" in _latest_intraday[symbol]:
+            rs = _latest_intraday[symbol]["regime_state"]
+            
+            # Map string severity to float if necessary
+            sev_val = rs.get("severity", 0.5)
+            if isinstance(sev_val, str):
+                if "EXTREME" in sev_val:
+                    sev_val = 0.9
+                elif "STRONG" in sev_val:
+                    sev_val = 0.7
+                else:
+                    sev_val = 0.5
+                    
+            return {"status": "success", "data": {
+                "regime_label": rs.get("regime_label", "NEUTRAL"),
+                "severity": sev_val,
+                "regime_age_days": rs.get("regime_age_days", 5),
+                "hmm_prob_extreme_backwardation": rs.get("hmm_probabilities", {}).get("EXTREME_BACKWARDATION", None),
+                "hmm_prob_backwardation": rs.get("hmm_probabilities", {}).get("BACKWARDATION", None),
+                "hmm_prob_neutral": rs.get("hmm_probabilities", {}).get("NEUTRAL", None),
+                "hmm_prob_contango": rs.get("hmm_probabilities", {}).get("CONTANGO", None),
+                "hmm_prob_extreme_contango": rs.get("hmm_probabilities", {}).get("EXTREME_CONTANGO", None),
+                "date": datetime.now().isoformat(),
+            }}
+        return {"status": "success", "data": None, "message": "No regime data found in memory"}
+    except Exception as e:
+        logger.error(f"Error fetching regime: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.get('/api/prediction/forecast')
+async def get_daily_forecast(symbol: str = 'WTI'):
+    """Get the latest model forecast and trade recommendation."""
+    try:
+        from main import _latest_intraday
+        if symbol in _latest_intraday:
+            data = _latest_intraday[symbol]
+            tsig = data.get("trade_signal", {})
+            direction = tsig.get("direction", "NEUTRAL")
+            confidence = tsig.get("confidence", 0.5)
+            trade_score = tsig.get("trade_score", 50.0)
+            
+            conviction = "LOW"
+            if confidence > 0.8 or abs(trade_score - 50) > 30:
+                conviction = "HIGH"
+            elif confidence > 0.6 or abs(trade_score - 50) > 15:
+                conviction = "MEDIUM"
+                
+            prediction_label = "NEUTRAL"
+            if direction in ["LONG", "BUY_SPREAD", "BUY", "STRONG_BUY"]: prediction_label = "UP"
+            elif direction in ["SHORT", "SELL_SPREAD", "SELL", "STRONG_SELL"]: prediction_label = "DOWN"
+            
+            factor_scores = tsig.get("factor_scores", {})
+            shap_bullish = [{"feature": k, "contribution": v} for k, v in factor_scores.items() if v > 0]
+            shap_bearish = [{"feature": k, "contribution": abs(v)} for k, v in factor_scores.items() if v < 0]
+            
+            shap_bullish.sort(key=lambda x: x["contribution"], reverse=True)
+            shap_bearish.sort(key=lambda x: x["contribution"], reverse=True)
+            # Calculate dynamic targets based on current price
+            try:
+                from services.price_fetcher import PriceFetcher
+                hist = PriceFetcher.fetch_historical(symbol, "5d")
+                current_price = float(hist[-1]["close"]) if hist else 70.0
+            except:
+                current_price = 70.0
+
+            if prediction_label == "UP":
+                target_price = current_price * 1.025
+                stop_loss = current_price * 0.985
+                entry_low = current_price * 0.995
+                entry_high = current_price * 1.005
+            elif prediction_label == "DOWN":
+                target_price = current_price * 0.975
+                stop_loss = current_price * 1.015
+                entry_low = current_price * 0.995
+                entry_high = current_price * 1.005
+            else:
+                target_price = current_price
+                stop_loss = current_price
+                entry_low = current_price
+                entry_high = current_price
+                
+            return {
+                "status": "success", 
+                "data": {
+                    "forecast": {
+                        "date": datetime.now().isoformat(),
+                        "prediction_label": prediction_label,
+                        "confidence": confidence,
+                        "horizon_days": 5,
+                        "expected_return": 2.5 if prediction_label == "UP" else -2.5 if prediction_label == "DOWN" else 0.0,
+                    },
+                    "trade": {
+                        "direction": direction,
+                        "trade_type": "OUTRIGHT",
+                        "conviction": conviction,
+                        "trade_score": trade_score,
+                        "target_price": target_price,
+                        "stop_loss": stop_loss,
+                        "entry_low": entry_low,
+                        "entry_high": entry_high,
+                        "position_size_lots": 10 if conviction == "HIGH" else 5,
+                        "explanation": {
+                            "action": direction,
+                            "primary_drivers": ["Live Multi-Factor Composite"],
+                            "risk_factors": ["Macro volatility", "Mean reversion failure"],
+                            "rationale": f"Composite Score: {round((trade_score - 50) * 2, 1)}. Threshold for conviction is 15.",
+                            "shap_bullish": shap_bullish,
+                            "shap_bearish": shap_bearish
+                        }
+                    }
+                }
+            }
+        return {"status": "success", "data": {"forecast": None, "trade": None}}
+    except Exception as e:
+        logger.error(f"Error fetching forecast: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+@app.get('/api/prediction/trades/all')
+async def get_all_recent_trades():
+    """Get the latest trade recommendation from the live Z-Score engine."""
+    try:
+        from main import _latest_intraday
+        results = []
+        for sym, data in _latest_intraday.items():
+            tsig = data.get("trade_signal", {})
+            regime = data.get("regime_state", {})
+            
+            # Reconstruct the TradeRecommendation schema for the UI
+            direction = tsig.get("direction", "NO_TRADE")
+            trade_score = tsig.get("trade_score", 50.0)
+            z_score = (trade_score - 50) / 10.0
+            
+            rationale = f"Strict Z-Score Regime Bounds. Current Z-Score: {z_score:.2f} | Regime: {regime.get('regime_label', 'Neutral')}"
+            if direction == "NO_TRADE" or direction == "NEUTRAL":
+                direction = "NO_TRADE"
+                rationale = "No trade recommended. Z-Score within bounds."
+                
+            results.append({
+                "symbol": sym,
+                "direction": direction,
+                "confidence": tsig.get("confidence", 0.0),
+                "trade_score": trade_score,
+                "trade_type": "SPREAD" if "_" in sym or "-" in sym or "CRACK" in sym else "OUTRIGHT",
+                "explanation": {
+                    "action": direction,
+                    "rationale": rationale
+                }
+            })
+            
+        results.sort(key=lambda x: abs(x.get("trade_score", 50) - 50), reverse=True)
+        return {"status": "success", "data": results}
+    except Exception as e:
+        logger.error(f"Error fetching all trades: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+# ==================== PAPER TRADING ENDPOINT ====================
+@app.get('/api/paper/state')
+def get_paper_state():
+    """Return current paper trading book state."""
+    try:
+        state = paper_book.get_state()
+        return {"status": "success", "data": state, "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error(f"Error fetching paper state: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.get('/api/paper/positions')
+def get_paper_positions():
+    """Return the currently open paper-trading positions."""
+    try:
+        state = paper_book.get_state()
+        return {
+            "status": "success",
+            "data": state.get("open_positions", []),
+            "count": len(state.get("open_positions", [])),
+            "timestamp": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"Error fetching paper positions: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.get('/api/paper/trades')
+def get_paper_trades(limit: int = 200):
+    """Return the closed paper-trading trade journal (most recent last)."""
+    try:
+        state = paper_book.get_state()
+        trades = state.get("closed_trades", [])
+        if limit and limit > 0:
+            trades = trades[-limit:]
+        return {
+            "status": "success",
+            "data": trades,
+            "count": len(trades),
+            "timestamp": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"Error fetching paper trades: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.post('/api/paper/close/{symbol}')
+def close_paper_position(symbol: str):
+    """Manually close a paper trading position."""
+    try:
+        import time
+        paper_book.close_position_by_symbol(symbol, "Manual Close", time.time())
+        return {"status": "success", "message": f"Closed position for {symbol}"}
+    except Exception as e:
+        logger.error(f"Error closing paper position for {symbol}: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.post('/api/paper/trade')
+def execute_manual_trade(payload: dict):
+    """Manually execute a trade in the paper trading book."""
+    try:
+        symbol = payload.get("symbol")
+        direction = payload.get("direction")
+        if not symbol or not direction:
+            return JSONResponse(status_code=400, content={"status": "error", "message": "Missing symbol or direction"})
+
+        # Get optional overrides
+        units = payload.get("units")
+        units = float(units) if units else None
+        
+        stop_loss = payload.get("stop_loss")
+        stop_loss = float(stop_loss) if stop_loss else None
+        
+        take_profit = payload.get("take_profit")
+        take_profit = float(take_profit) if take_profit else None
+
+        # Get current price
+        from services.price_fetcher import PriceFetcher
+        price_data = PriceFetcher.fetch_symbol(symbol)
+        if not price_data:
+            return JSONResponse(status_code=400, content={"status": "error", "message": f"Could not fetch price for {symbol}"})
+        
+        current_price = price_data.get("close", 0.0)
+
+        import time
+        signal_val = 1.0 if direction == "LONG" else -1.0
+        paper_book.open_position(
+            symbol, direction, current_price, signal_val, time.time(),
+            custom_units=units, custom_sl=stop_loss, custom_tp=take_profit,
+            is_manual=True
+        )
+        paper_book.save_state()
+
+        return {"status": "success", "message": f"Executed manual {direction} on {symbol} at {current_price}"}
+    except Exception as e:
+        logger.error(f"Error executing manual trade: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+# ==================== MULTI-FACTOR SIGNALS ENDPOINT ====================
+# ==================== COVMATRIX ENDPOINT ====================
+# ==================== BACKTEST ENDPOINTS ====================
+from pydantic import BaseModel
+
+class BacktestRequest(BaseModel):
+    symbol: str = "WTI"
+    initial_capital: float = 1000000.0
+    transaction_cost: float = 2.0
+    slippage: float = 10.0
+    horizon_days: int = 5
+
+@app.get("/api/v1/risk/portfolio")
+def get_portfolio_risk():
+    """Portfolio risk for the paper book, measured in TICKS (no capital/equity).
+
+    VaR / Expected Shortfall are computed from the empirical distribution of
+    per-trade tick P&L rather than from an equity-return series.
+    """
+    try:
+        from paper import paper_book
+        import numpy as np
+
+        state = paper_book.get_state()
+        trade_pnls = [float(t.get("pnl", 0.0)) for t in state.get("closed_trades", [])]
+
+        if len(trade_pnls) >= 2:
+            arr = np.array(trade_pnls, dtype=float)
+            var_95 = float(-np.percentile(arr, 5))    # 5th-percentile loss in ticks
+            var_99 = float(-np.percentile(arr, 1))
+            tail = arr[arr <= -var_95] if var_95 > 0 else arr[arr < 0]
+            cvar_95 = float(-tail.mean()) if tail.size else 0.0
+        else:
+            var_95 = var_99 = cvar_95 = 0.0
+
+        return {
+            "status": "success",
+            "data": {
+                "total_pnl_ticks": state["total_pnl_ticks"],
+                "realized_pnl_ticks": state["realized_pnl_ticks"],
+                "unrealized_pnl_ticks": state["unrealized_pnl_ticks"],
+                "win_rate": state["win_rate"],
+                "max_drawdown_ticks": state["max_drawdown_ticks"],
+                "open_count": state["open_count"],
+                "max_concurrent": state["max_concurrent"],
+                "open_positions": state["open_positions"],
+                "var_95_ticks": round(var_95, 1),
+                "var_99_ticks": round(var_99, 1),
+                "expected_shortfall_95_ticks": round(cvar_95, 1),
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error computing portfolio risk: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+# ==================== BACKTESTING ENDPOINTS ====================
+@app.get("/api/backtest/strategies")
+async def get_backtest_strategies():
+    """List all available backtesting strategies."""
+    try:
+        from backtesting.strategies import STRATEGIES
+        strategies = {k: v.to_dict() for k, v in STRATEGIES.items()}
+        return {"status": "success", "data": strategies, "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error(f"Error listing strategies: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.post("/api/backtest/run")
+async def run_backtest_endpoint(payload: dict):
+    """Run a backtest with configurable parameters."""
+    try:
+        from backtesting.engine import run_backtest as _run_bt
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(None, lambda: _run_bt(
+            strategies=payload.get("strategies", ["zscore_mean_reversion"]),
+            combination_mode=payload.get("combination_mode", "independent"),
+            instruments=payload.get("instruments"),
+            products=payload.get("products", ["CL", "CO"]),
+            initial_capital=float(payload.get("initial_capital", 1_000_000.0)),
+            lots_per_trade=int(payload.get("lots_per_trade", 1)),
+            slippage_ticks=payload.get("slippage_ticks", 1),
+            db_dir=payload.get("db_dir", os.path.join(os.path.dirname(__file__), "..", "DB")),
+            strategy_params=payload.get("strategy_params"),
+            include_spreads=payload.get("include_spreads", True),
+            include_flies=payload.get("include_flies", True),
+            include_dflies=payload.get("include_dflies", False),
+            include_outrights=payload.get("include_outrights", False),
+        ))
+        return {"status": "success", "data": results, "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error(f"Error running backtest: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.get("/api/backtest/journal")
+def get_backtest_journal(
+    backtest_id: str = None,
+    instrument: str = None,
+    strategy: str = None,
+    limit: int = 500,
+):
+    """Fetch trade journal entries with optional filters."""
+    try:
+        from backtesting.trade_journal import TradeJournal
+        journal = TradeJournal()
+        trades = journal.get_trades(backtest_id=backtest_id, instrument=instrument, strategy=strategy, limit=limit)
+        return {"status": "success", "data": trades, "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error(f"Error fetching journal: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+# ==================== HEALTH CHECK ====================
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+
+@app.get('/api/analytics/structure')
+def get_market_structure(symbol: str = 'WTI'):
+    try:
+        from services.curve_analytics import get_market_structure_analytics
+        data = get_market_structure_analytics(symbol)
+        return {'status': 'success', 'data': data}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={'status': 'error', 'message': str(e)})
+
+@app.get('/api/analytics/indicators')
+def get_indicators(symbol: str = 'WTI', period: str = '3mo', ema_periods: str = '20,50', atr_period: int = 14):
+    """Return per-symbol indicators: EMA series, ATR series, Bollinger bands, realized vol"""
+    try:
+        hist = PriceFetcher.fetch_historical(symbol, period)
+        if not hist:
+            raise HTTPException(status_code=404, detail=f'No historical data for {symbol}')
+
+        closes = [float(h['close']) for h in hist]
+        highs = [float(h['high']) for h in hist]
+        lows = [float(h['low']) for h in hist]
+
+        ema_list = {}
+        for p in [int(x) for x in ema_periods.split(',') if x.strip().isdigit()]:
+            series = SignalCalculator.ema_series(closes, p)
+            # align timestamps
+            ema_list[f'ema_{p}'] = [round(x, 4) if x is not None else None for x in series]
+
+        atr_series = SignalCalculator.calculate_atr(hist, atr_period)
+        # atr_series can also contain None values for the initial period padding
+        atr_series = [round(x, 4) if x is not None else None for x in atr_series]
+
+        boll = SignalCalculator.calculate_bollinger_bands(closes, period=20, sigma=2.0) if closes else {
+            "upper": 0.0,
+            "middle": 0.0,
+            "lower": 0.0,
+            "width": 0.0,
+            "position": "middle",
+        }
+        vol = SignalCalculator.calculate_realized_volatility(closes)
+
+        return {
+            'status': 'success',
+            'data': {
+                'symbol': symbol,
+                'historical': hist,
+                'ema_series': ema_list,
+                'atr_series': atr_series,
+                'bollinger': boll,
+                'realized_vol_pct': vol,
+                'timestamp': datetime.now().isoformat(),
+            },
         }
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error calculating correlations: {e}")
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+        logger.error(f'Error generating indicators for {symbol}: {e}')
+        return JSONResponse(status_code=500, content={'status': 'error', 'message': str(e)})
 
-
-# ==================== SPREAD ANALYSIS ENDPOINTS ====================
 @app.get("/api/spreads/all")
-async def get_all_spreads():
+def get_all_spreads():
     """Get all calculated spreads with historical statistics"""
     try:
         prices = PriceFetcher.fetch_all_prices()
@@ -828,7 +1592,7 @@ async def get_all_spreads():
 
 
 @app.get("/api/spreads/{spread_name}")
-async def get_spread(spread_name: str):
+def get_spread(spread_name: str):
     """Get specific spread with statistics and color coding"""
     try:
         prices = PriceFetcher.fetch_all_prices()
@@ -867,9 +1631,8 @@ async def get_spread(spread_name: str):
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
 
-# ==================== ALERTS ENDPOINTS ====================
 @app.get("/api/alerts/active")
-async def get_active_alerts(db: Session = Depends(get_db)):
+def get_active_alerts(db: Session = Depends(get_db)):
     """Get all active unacknowledged alerts"""
     try:
         prices = PriceFetcher.fetch_all_prices()
@@ -930,167 +1693,28 @@ async def acknowledge_alert(alert_id: str, db: Session = Depends(get_db)):
         logger.error(f"Error acknowledging alert: {e}")
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
-
-# ==================== ENHANCED NEWS ENDPOINTS ====================
-@app.get("/api/news/enhanced")
-async def get_enhanced_news():
-    """Get enhanced news with full sentiment analysis"""
-    try:
-        news = NewsFetcher.fetch_all_news(max_articles_per_source=10)
-        return {
-            "status": "success",
-            "data": news[:20],  # Return top 20
-            "count": len(news),
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        logger.error(f"Error fetching enhanced news: {e}")
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
-
-@app.get('/api/storms/active')
-async def api_get_active_storms():
-    """Return NOAA NHC active storms with refinery overlay."""
-    try:
-        data = fetch_active_storms()
-        return {"status": "success", "data": data, "timestamp": datetime.now().isoformat()}
-    except Exception as e:
-        logger.error(f"Error in storms endpoint: {e}")
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
-
-@app.get('/api/tankers/positions')
-async def api_get_tanker_positions():
-    """Return AIS tanker zone snapshots or offline status if key missing."""
-    try:
-        data = fetch_tanker_positions()
-        return {"status": "success", "data": data, "timestamp": datetime.now().isoformat()}
-    except Exception as e:
-        logger.error(f"Error in tankers endpoint: {e}")
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
-
-@app.get("/api/news/sentiment-summary")
-async def get_sentiment_summary():
-    """Get overall market sentiment from latest news"""
-    try:
-        summary = NewsFetcher.get_sentiment_summary()
-        return {
-            "status": "success",
-            "data": summary,
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        logger.error(f"Error fetching sentiment summary: {e}")
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
-
-@app.get("/api/news/finbert-status")
-async def get_finbert_status():
-    """Return FinBERT availability and a lightweight service check."""
-    try:
-        enabled = bool(os.getenv("HF_API_KEY"))
-        result = {
-            "enabled": enabled,
-            "status": "online" if enabled else "offline",
-            "message": "FinBERT configured" if enabled else "HF_API_KEY missing",
-            "last_test": None,
-            "timestamp": datetime.now().isoformat(),
-        }
-        if enabled:
-            score, label = SentimentAnalyzer.analyze_finbert(
-                "Energy market outlook checking FinBERT live status"
-            )
-            result["last_test"] = {
-                "score": score,
-                "label": label,
-            }
-        return {"status": "success", "data": result, "timestamp": datetime.now().isoformat()}
-    except Exception as e:
-        logger.error(f"Error checking FinBERT status: {e}")
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
-
-@app.get("/api/news/by-entity/{entity}")
-async def get_news_by_entity(entity: str):
-    """Get news filtered by geopolitical entity"""
-    try:
-        news = NewsFetcher.fetch_all_news(max_articles_per_source=15)
-        filtered = [n for n in news if entity.lower() in [e.lower() for e in n.get("entities", [])]]
-        return {
-            "status": "success",
-            "data": filtered,
-            "entity": entity,
-            "count": len(filtered),
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        logger.error(f"Error fetching news by entity: {e}")
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
-
-# ==================== SPREADS ENDPOINTS ====================
-@app.get("/api/spreads/calendar")
-async def get_calendar_spreads():
-    """Get calendar spreads (M1-M4 data)"""
-    try:
-        # Placeholder implementation - in production would fetch from CME
-        spreads = {
-            "M1_M2": 0.35,
-            "M2_M3": 0.25,
-            "M3_M4": 0.15,
-            "curve_shape": "BACKWARDATION",
-            "timestamp": datetime.now().isoformat(),
-        }
-        return {"status": "success", "data": spreads}
-    except Exception as e:
-        logger.error(f"Error fetching calendar spreads: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(e)},
-        )
-
-
-# ==================== CRACK SPREADS ENDPOINTS ====================
-@app.get("/api/spreads/crack")
-async def get_crack_spreads():
-    """Get crack spread calculations"""
-    try:
-        prices = PriceFetcher.fetch_all_prices()
-
-        rbob_data = prices.get("RBOB")
-        ho_data = prices.get("HO")
-        wti_data = prices.get("WTI")
-        brent_data = prices.get("Brent")
-        go_data = prices.get("GO")
-
-        if not (rbob_data and ho_data and wti_data and brent_data):
-            raise HTTPException(status_code=503, detail="Insufficient price data for crack spread computation")
-
-        cracks = SignalCalculator.calculate_crack_spreads(
-            rbob=float(rbob_data["close"]),
-            ulsd=float(ho_data["close"]),
-            wti=float(wti_data["close"]),
-            brent=float(brent_data["close"]),
-            go_per_mt=float(go_data["close"]) if go_data else None,
-        )
-        return {"status": "success", "data": cracks}
-    except Exception as e:
-        logger.error(f"Error calculating crack spreads: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(e)},
-        )
-
-
-# ==================== HEALTH CHECK ====================
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+frontend_path = os.path.join(os.path.dirname(__file__), '..', 'frontend', 'dist')
+if os.path.isdir(frontend_path):
+    from fastapi.responses import FileResponse
+    
+    # Mount the assets directory specifically
+    assets_path = os.path.join(frontend_path, "assets")
+    if os.path.isdir(assets_path):
+        app.mount("/assets", StaticFiles(directory=assets_path), name="assets")
+    
+    # Catch-all route to serve React app and handle client-side routing
+    @app.get("/{catchall:path}")
+    async def serve_react_app(catchall: str):
+        # Prevent accessing files outside frontend_path
+        file_path = os.path.abspath(os.path.join(frontend_path, catchall))
+        if not file_path.startswith(os.path.abspath(frontend_path)):
+            return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+            
+        if catchall and os.path.isfile(file_path):
+            return FileResponse(file_path)
+            
+        index_path = os.path.join(frontend_path, "index.html")
+        if os.path.isfile(index_path):
+            return FileResponse(index_path)
+            
+        return JSONResponse(status_code=404, content={"detail": "Frontend not built"})

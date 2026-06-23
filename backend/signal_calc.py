@@ -15,8 +15,9 @@ class SignalCalculator:
             return None
 
         k = 2 / (period + 1)
-        ema = prices[0]
-        for price in prices[1:]:
+        # Standard EMA starts with SMA of first `period` prices
+        ema = sum(prices[:period]) / period
+        for price in prices[period:]:
             ema = price * k + ema * (1 - k)
         return ema
 
@@ -58,13 +59,16 @@ class SignalCalculator:
     @staticmethod
     def ema_series(prices: List[float], period: int) -> List[float]:
         """Return EMA series aligned with prices (None for first period-1 values)"""
-        if len(prices) < 1:
-            return []
+        if len(prices) < period:
+            return [None] * len(prices)
         k = 2 / (period + 1)
-        emas: List[float] = []
-        ema = prices[0]
+        emas: List[float] = [None] * (period - 1)
+        
+        # Standard EMA starts with SMA of the first `period` prices
+        ema = sum(prices[:period]) / period
         emas.append(ema)
-        for price in prices[1:]:
+        
+        for price in prices[period:]:
             ema = price * k + ema * (1 - k)
             emas.append(ema)
         return emas
@@ -229,9 +233,9 @@ class SignalCalculator:
     ) -> Dict:
         """Calculate crack spreads"""
         # 3:2:1 Crack Spread ($/bbl)
-        # RBOB and ULSD in ¢/gal, convert to $/bbl
-        rbob_bbl = rbob * 42 / 100
-        ulsd_bbl = ulsd * 42 / 100
+        # RBOB and ULSD in $/gal, already converted to $/bbl
+        rbob_bbl = rbob
+        ulsd_bbl = ulsd
         crack_321 = (2 * rbob_bbl + 1 * ulsd_bbl - 3 * wti) / 3
         crack_532 = (3 * rbob_bbl + 2 * ulsd_bbl - 5 * wti) / 5
 
@@ -307,3 +311,80 @@ class SignalCalculator:
             return None
 
         return covariance / variance
+
+    @staticmethod
+    def calculate_rsi(prices: List[float], period: int = 14) -> Optional[float]:
+        """Calculate Relative Strength Index"""
+        if len(prices) < period + 1:
+            return None
+            
+        deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+        gains = [d if d > 0 else 0 for d in deltas]
+        losses = [-d if d < 0 else 0 for d in deltas]
+        
+        avg_gain = sum(gains[:period]) / period
+        avg_loss = sum(losses[:period]) / period
+        
+        for i in range(period, len(prices) - 1):
+            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+            
+        if avg_loss == 0:
+            return 100.0
+            
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    @staticmethod
+    def calculate_macd(prices: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Dict:
+        """Calculate MACD"""
+        if len(prices) < slow + signal:
+            return {"macd": None, "signal": None, "histogram": None}
+            
+        fast_ema = SignalCalculator.ema_series(prices, fast)
+        slow_ema = SignalCalculator.ema_series(prices, slow)
+        
+        macd_line = []
+        for f, s in zip(fast_ema, slow_ema):
+            if f is not None and s is not None:
+                macd_line.append(f - s)
+            else:
+                macd_line.append(None)
+                
+        # Calculate signal line
+        valid_macd = [x for x in macd_line if x is not None]
+        if len(valid_macd) < signal:
+            return {"macd": None, "signal": None, "histogram": None}
+            
+        signal_line_valid = SignalCalculator.ema_series(valid_macd, signal)
+        signal_line = [None] * (len(macd_line) - len(valid_macd)) + signal_line_valid
+        
+        macd_val = macd_line[-1]
+        sig_val = signal_line[-1]
+        hist_val = macd_val - sig_val if macd_val is not None and sig_val is not None else None
+        
+        return {
+            "macd": macd_val,
+            "signal": sig_val,
+            "histogram": hist_val
+        }
+
+    @staticmethod
+    def calculate_momentum_roc(prices: List[float], period: int = 14) -> Optional[float]:
+        """Calculate Rate of Change"""
+        if len(prices) <= period:
+            return None
+        return ((prices[-1] - prices[-(period+1)]) / prices[-(period+1)]) * 100
+
+    @staticmethod
+    def calculate_price_zscore(prices: List[float], period: int = 20) -> Optional[float]:
+        """Calculate Price Z-Score"""
+        if len(prices) < period:
+            return None
+        recent = prices[-period:]
+        mean = sum(recent) / period
+        variance = sum((p - mean) ** 2 for p in recent) / period
+        std = variance ** 0.5
+        if std == 0:
+            return 0.0
+        return (prices[-1] - mean) / std

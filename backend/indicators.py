@@ -15,14 +15,27 @@ import pandas as pd
 def ema(series: pd.Series, period: int) -> pd.Series:
     """Exponentially-weighted moving average (alpha smoothing).
 
-    Uses pandas ewm to compute EMA.
+    Calculated recursively starting from the SMA of the first `period` elements.
     """
-    return series.astype(float).ewm(span=period, adjust=False).mean()
+    if len(series) < period:
+        return pd.Series(index=series.index, dtype=float)
+    
+    k = 2 / (period + 1)
+    ema_vals = [float('nan')] * (period - 1)
+    
+    current_ema = series.iloc[:period].mean()
+    ema_vals.append(current_ema)
+    
+    for val in series.iloc[period:]:
+        current_ema = float(val) * k + current_ema * (1 - k)
+        ema_vals.append(current_ema)
+        
+    return pd.Series(ema_vals, index=series.index)
 
 
 def bollinger_bands(prices: pd.Series, period: int = 20, std: float = 2.0) -> Dict[str, pd.Series]:
-    ma = prices.rolling(window=period, min_periods=1).mean()
-    sd = prices.rolling(window=period, min_periods=1).std(ddof=0)
+    ma = prices.rolling(window=period).mean()
+    sd = prices.rolling(window=period).std(ddof=0)
     upper = ma + std * sd
     lower = ma - std * sd
     bandwidth = (upper - lower) / ma.replace(0, np.nan)
@@ -92,7 +105,12 @@ def kalman_pair_filter(y: pd.Series, x: pd.Series) -> Dict[str, float]:
     beta = np.polyfit(xv, yv, 1)[0]
     spread = yv - beta * xv
     spread_last = float(spread.iloc[-1])
-    z = (spread - spread.mean()) / (spread.std(ddof=0) if spread.std(ddof=0) > 0 else 1)
+    
+    # 20-period rolling mean and standard deviation for the z-score to avoid lookahead bias
+    rolling_mean = spread.rolling(window=20, min_periods=1).mean()
+    rolling_std = spread.rolling(window=20, min_periods=1).std(ddof=0)
+    rolling_std_clean = rolling_std.apply(lambda val: val if val > 0 else 1.0)
+    z = (spread - rolling_mean) / rolling_std_clean
     z_last = float(z.iloc[-1])
     return {"beta": float(beta), "spread": spread_last, "z_score": z_last}
 

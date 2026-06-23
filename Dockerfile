@@ -6,6 +6,8 @@ WORKDIR /app
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     gcc \
+    g++ \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy and install Python dependencies
@@ -46,14 +48,14 @@ COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 # Copy full source
 COPY . .
 
-EXPOSE 8000
+EXPOSE 7860
 
 ENV PYTHONUNBUFFERED=1
-ENV PORT=8000
+ENV PORT=7860
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD python -c "import requests; requests.get('http://localhost:8000/docs', timeout=5)"
+# No Docker HEALTHCHECK: HF Spaces does its own port-based readiness probe on
+# 7860. A custom healthcheck here can keep the Space pinned at "Starting" even
+# when the app is serving, so we let HF handle readiness.
 
 # Serve frontend as static files + API backend
-CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--app-dir", "backend"]
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860", "--app-dir", "backend"]

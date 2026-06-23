@@ -12,7 +12,7 @@ interface TankerWatchProps {
   data?: {
     status?: string
     message?: string
-    zones?: TankerZone[]
+    zones?: TankerZone[] | Record<string, any>
     timestamp?: string
   }
 }
@@ -20,7 +20,19 @@ interface TankerWatchProps {
 export default function TankerWatch({ data }: TankerWatchProps) {
   const status = data?.status ?? 'offline'
   const online = status === 'online'
-  const zones = data?.zones ?? []
+  
+  const rawZones = data?.zones ?? {}
+  const zones: TankerZone[] = Array.isArray(rawZones)
+    ? rawZones
+    : Object.entries(rawZones).map(([zoneName, zoneData]: [string, any]) => ({
+        zone: zoneName,
+        confirmed_tankers: zoneData?.confirmed_tankers ?? 0,
+        total_vessels: zoneData?.total ?? 0,
+        vessels: (zoneData?.samples ?? []).map((s: any) => ({
+          name: s.name,
+          speed_kt: s.sog,
+        })),
+      }))
 
   return (
     <Card title="AIS Tanker Watch">

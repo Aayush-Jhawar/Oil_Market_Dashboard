@@ -21,6 +21,7 @@ It displays energy market prices, spread analytics, sentiment and news, macro/EI
 - The backend gathers market prices, news, macro data, and analytic signals.
 - The frontend stores data in the dashboard store and renders it into the selected tab.
 - The alert and spreads panels refresh automatically in the browser every few seconds.
+- A separate live snapshot preview component has been removed; current prices are now shown in the header strip and Overview tab cards from the same REST feed.
 
 ## Dashboard Header and Top Strip
 - Fixed header bar showing:
@@ -29,6 +30,7 @@ It displays energy market prices, spread analytics, sentiment and news, macro/EI
   - price pills for key products: `WTI`, `RBOB`, `HO`, `BRENT`, `GO`, `DXY`
   - composite score bar with a normalized gauge
 - Page title updated to: **Oil Market Dashboard**
+- Latest prices are rendered from `GET /api/prices/all` and displayed in the header strip instead of a separate live snapshot panel.
 - Top content area now has padding so the fixed header does not cut off the page.
 
 ## Tabs and What They Show

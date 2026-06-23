@@ -1,0 +1,114 @@
+[
+  {
+    "Commodity": "WTI",
+    "Structure": "DFly M1-M2-M3-M4",
+    "Avg_Weight_BB": 35.25,
+    "Avg_Weight_Z": 35.25,
+    "Avg_Weight_EMA": 29.51,
+    "Feature_Importance": {
+      "vol_1h": 0.184,
+      "vol_24h": 0.246,
+      "roc_1h": 0.119,
+      "macd": 0.353,
+      "spread_level": 0.097
+    }
+  },
+  {
+    "Commodity": "WTI",
+    "Structure": "Outright M1",
+    "Avg_Weight_BB": 33.25,
+    "Avg_Weight_Z": 33.25,
+    "Avg_Weight_EMA": 33.5,
+    "Feature_Importance": {
+      "vol_1h": 0.042,
+      "vol_24h": 0.16,
+      "roc_1h": 0.102,
+      "macd": 0.33,
+      "spread_level": 0.366
+    }
+  },
+  {
+    "Commodity": "Brent",
+    "Structure": "DFly M1-M2-M3-M4",
+    "Avg_Weight_BB": 34.19,
+    "Avg_Weight_Z": 34.19,
+    "Avg_Weight_EMA": 31.62,
+    "Feature_Importance": {
+      "vol_1h": 0.135,
+      "vol_24h": 0.52,
+      "roc_1h": 0.048,
+      "macd": 0.207,
+      "spread_level": 0.09
+    }
+  },
+  {
+    "Commodity": "Brent",
+    "Structure": "Outright M1",
+    "Avg_Weight_BB": 33.14,
+    "Avg_Weight_Z": 33.14,
+    "Avg_Weight_EMA": 33.71,
+    "Feature_Importance": {
+      "vol_1h": 0.183,
+      "vol_24h": 0.25,
+      "roc_1h": 0.044,
+      "macd": 0.269,
+      "spread_level": 0.254
+    }
+  },
+  {
+    "Commodity": "HeatingOil",
+    "Structure": "DFly M1-M2-M3-M4",
+    "Avg_Weight_BB": 33.49,
+    "Avg_Weight_Z": 33.49,
+    "Avg_Weight_EMA": 33.03,
+    "Feature_Importance": {
+      "vol_1h": 0.185,
+      "vol_24h": 0.046,
+      "roc_1h": 0.19,
+      "macd": 0.337,
+      "spread_level": 0.243
+    }
+  },
+  {
+    "Commodity": "HeatingOil",
+    "Structure": "Outright M1",
+    "Avg_Weight_BB": 33.34,
+    "Avg_Weight_Z": 33.34,
+    "Avg_Weight_EMA": 33.33,
+    "Feature_Importance": {
+      "vol_1h": 0.271,
+      "vol_24h": 0.253,
+      "roc_1h": 0.098,
+      "macd": 0.25,
+      "spread_level": 0.128
+    }
+  },
+  {
+    "Commodity": "Gasoil",
+    "Structure": "DFly M1-M2-M3-M4",
+    "Avg_Weight_BB": 40.23,
+    "Avg_Weight_Z": 40.23,
+    "Avg_Weight_EMA": 19.54,
+    "Feature_Importance": {
+      "vol_1h": 0.239,
+      "vol_24h": 0.321,
+      "roc_1h": 0.089,
+      "macd": 0.141,
+      "spread_level": 0.209
+    }
+  },
+  {
+    "Commodity": "Gasoil",
+    "Structure": "Outright M1",
+    "Avg_Weight_BB": 32.73,
+    "Avg_Weight_Z": 32.73,
+    "Avg_Weight_EMA": 34.54,
+    "Feature_Importance": {
+      "vol_1h": 0.111,
+      "vol_24h": 0.311,
+      "roc_1h": 0.069,
+      "macd": 0.224,
+      "spread_level": 0.285
+    }
+  }
+]

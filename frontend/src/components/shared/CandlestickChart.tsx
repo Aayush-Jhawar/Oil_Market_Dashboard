@@ -2,6 +2,7 @@ import {
   ResponsiveContainer,
   ComposedChart,
   Bar,
+  Line,
   XAxis,
   YAxis,
   Tooltip,
@@ -91,7 +92,7 @@ export default function CandlestickChart({
       <ComposedChart data={chartData} margin={{ top: 20, right: 30, left: 0, bottom: 0 }}>
         <CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.2)" />
         <XAxis dataKey="timestamp" tick={{ fill: '#94A3B8', fontSize: 12 }} />
-        <YAxis tick={{ fill: '#94A3B8', fontSize: 12 }} />
+        <YAxis domain={['auto', 'auto']} tick={{ fill: '#94A3B8', fontSize: 12 }} />
         <Tooltip
           contentStyle={{
             backgroundColor: 'rgba(15, 23, 42, 0.95)',
@@ -104,6 +105,14 @@ export default function CandlestickChart({
         <Bar
           dataKey="close"
           shape={<CustomCandleShape />}
+          isAnimationActive={false}
+        />
+        <Line 
+          type="monotone" 
+          dataKey="close" 
+          stroke="#3B82F6" 
+          dot={false} 
+          strokeWidth={2}
           isAnimationActive={false}
         />
       </ComposedChart>

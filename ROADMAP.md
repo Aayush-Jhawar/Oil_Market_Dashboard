@@ -4,11 +4,6 @@ This document outlines a phased plan to implement the v2.0 spec (`OIL_DASHBOARD_
 
 Phases (high level)
 
-1. Phase 0 — Prep (env + repo)
-   - Lock Python version (use 3.11/3.12), record required env variables in `.env.example`.
-   - Ensure backend `requirements.txt` lists numpy, pandas, fastapi, uvicorn, websockets, aiohttp.
-   - Ensure frontend `package.json` has TypeScript and Zustand installed.
-
 2. Phase 1 — Core indicators & data modules (safe, offline-first)
    - Implement `backend/indicators.py` (EMA, BB, ATR, realized vol, ewma cov, kalman filter).
    - Add unit tests for indicators (small, deterministic inputs).

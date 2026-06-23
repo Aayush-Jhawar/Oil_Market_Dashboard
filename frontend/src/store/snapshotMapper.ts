@@ -7,7 +7,8 @@ function mapSnapshotToLegacy(snapshot: any) {
   const legacySet = useLegacyStore.getState()
 
   // Map prices
-  const pricesData: Record<string, any> = {}
+  const legacyState = useLegacyStore.getState()
+  const pricesData: Record<string, any> = { ...legacyState.prices }
   const priceData = snapshot.price?.data || snapshot.header?.prices || {}
   const ts = snapshot.ts || new Date().toISOString()
   Object.keys(priceData).forEach((sym) => {
@@ -35,10 +36,15 @@ function mapSnapshotToLegacy(snapshot: any) {
     const mapped = {
       composite_score: signals.composite_score ?? signals.composite ?? 0,
       regime: signals.regime ?? 'NEUTRAL',
+      regime_type: signals.regime_type ?? 'RANGING',
+      signal: signals.signal ?? 'NEUTRAL',
+      confidence: signals.confidence ?? 0,
       sub_scores: signals.sub_scores ?? {},
+      factor_scores: signals.factor_scores ?? {},
       weights: signals.weights ?? {},
       volatility_pct: signals.vol_annualized ?? signals.volatility_pct ?? 0,
       vol_regime: signals.vol_regime ?? 'NORMAL',
+      by_symbol: signals.by_symbol ?? {},
       timestamp: ts,
     }
     try {

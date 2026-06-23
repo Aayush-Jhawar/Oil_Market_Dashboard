@@ -99,3 +99,19 @@ body {
 .tab-inactive {
   @apply border-b-2 border-transparent text-energy-text-secondary hover:bg-energy-bg-tertiary;
 }
+
+@keyframes ticker-scroll {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(calc(-50% - 0.75rem)); }
+}
+
+.ticker-container {
+  display: flex;
+  gap: 1.5rem;
+  width: max-content;
+  animation: ticker-scroll 25s linear infinite;
+}
+
+.ticker-container:hover {
+  animation-play-state: paused;
+}

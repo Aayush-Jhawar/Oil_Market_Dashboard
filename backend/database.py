@@ -5,10 +5,12 @@ import os
 
 import config  # noqa: F401
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./energy.db")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "energy.db").replace("\\", "/")
+DATABASE_URL = f"sqlite:///{DB_PATH}"
 
 engine = create_engine(
-    DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
+    DATABASE_URL, connect_args={"check_same_thread": False, "timeout": 30} if "sqlite" in DATABASE_URL else {}
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

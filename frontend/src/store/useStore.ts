@@ -6,6 +6,8 @@ export const useDashboardStore = create<DashboardStore>((set) => ({
   prices: {},
   historicalPrices: {},
   eiaData: {},
+  eiaStatus: 'loading',
+  cftcStatus: 'loading',
   news: [],
   signals: null,
   cracks: null,
@@ -15,6 +17,9 @@ export const useDashboardStore = create<DashboardStore>((set) => ({
   forwardCurve: [],
   analytics: null,
   enhancedSignals: null,
+  tankerData: null,
+  stormData: null,
+  anchorData: null,
 
   baseSizeContracts: 10,
   compositeThreshold: 30,
@@ -57,6 +62,12 @@ export const useDashboardStore = create<DashboardStore>((set) => ({
   setEIAData: (data: Record<string, EIADataPoint>) =>
     set({ eiaData: data }),
 
+  setEIAStatus: (status) =>
+    set({ eiaStatus: status }),
+
+  setCFTCStatus: (status) =>
+    set({ cftcStatus: status }),
+
   setForwardCurve: (curve: ForwardCurvePoint[]) =>
     set({ forwardCurve: curve }),
 
@@ -68,6 +79,16 @@ export const useDashboardStore = create<DashboardStore>((set) => ({
 
   setIndicators: (indicators: Record<string, any>) =>
     set({ indicators }),
+
+
+  setTankerData: (data: any) =>
+    set({ tankerData: data }),
+
+  setStormData: (data: any) =>
+    set({ stormData: data }),
+
+  setAnchorData: (data: any) =>
+    set({ anchorData: data }),
 
   setActiveTab: (tab: DashboardTab) =>
     set({ activeTab: tab }),

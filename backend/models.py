@@ -56,32 +56,7 @@ class NewsItem(Base):
     entities = Column(JSON, default=list)  # geopolitical entities mentioned
 
 
-class SpreadAnalysis(Base):
-    __tablename__ = "spreads"
-    
-    id = Column(String, primary_key=True, index=True)
-    spread_name = Column(String, index=True)  # e.g., "BRENT-WTI", "GASOLINE-CRACK"
-    value = Column(Float)
-    avg_5day = Column(Float)
-    avg_30day = Column(Float)
-    deviation_5day = Column(Float)  # z-score from 5-day average
-    deviation_30day = Column(Float)  # z-score from 30-day average
-    is_anomaly = Column(Boolean, default=False)
-    timestamp = Column(DateTime, server_default=func.now(), index=True)
 
-
-class Alert(Base):
-    __tablename__ = "alerts"
-    
-    id = Column(String, primary_key=True, index=True)
-    alert_type = Column(String, index=True)  # e.g., "spread_anomaly", "volume_spike", "price_move"
-    severity = Column(String)  # "warning", "critical"
-    message = Column(String)
-    symbol = Column(String, nullable=True)
-    value = Column(Float, nullable=True)
-    threshold = Column(Float, nullable=True)
-    created_at = Column(DateTime, server_default=func.now(), index=True)
-    is_acknowledged = Column(Boolean, default=False)
 
 
 class MacroIndicator(Base):
@@ -92,3 +67,16 @@ class MacroIndicator(Base):
     value = Column(Float)
     change_pct = Column(Float)
     timestamp = Column(DateTime, server_default=func.now(), index=True)
+
+
+class BacktestResult(Base):
+    __tablename__ = "backtest_results"
+    
+    id = Column(String, primary_key=True, index=True)
+    symbol = Column(String, index=True)
+    strategy_name = Column(String)
+    parameters = Column(JSON)  # Store configuration like transaction costs, slippage
+    metrics = Column(JSON)     # Store dict of Sharpe, Return, Drawdown, etc.
+    equity_curve = Column(JSON) # Store daily equity curve
+    trade_log = Column(JSON)    # Store trades executed
+    created_at = Column(DateTime, server_default=func.now(), index=True)

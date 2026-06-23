@@ -29,8 +29,9 @@ export interface DashboardSnapshot {
   ts: string;
   tick: number;
   header: {
-    regime: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
-    vol_regime: 'HIGH' | 'NORMAL' | 'LOW';
+    regime?: string;
+    regimes?: Record<string, string>;
+    vol_regime?: 'HIGH' | 'NORMAL' | 'LOW';
     composite_score: number;
     prices: Record<string, PriceEntry>;
   };
@@ -44,7 +45,22 @@ export interface DashboardSnapshot {
   analytics?: AnalyticsSnapshot;
   fundamentals?: Record<string, number>;
   futures?: {
+    /** M1→price lookup built by the backend forward-curve service */
     curve?: Record<string, number>;
+    /** Full per-contract detail array: [{month, label, ticker, price, change_pct}] */
+    points?: Array<{
+      month: string;
+      label: string;
+      ticker: string;
+      price: number;
+      change_pct: number;
+    }>;
+    structure?: 'BACKWARDATION' | 'CONTANGO' | 'FLAT' | 'UNKNOWN';
+    m1_m12_spread?: number | null;
+    m1_price?: number | null;
+    m12_price?: number | null;
+    fetched_at?: string;
+    ok?: boolean;
   };
   forwardCurve?: { month: string; price: number }[];
   macro?: {
@@ -118,4 +134,6 @@ export interface DashboardSnapshot {
     error?: string;
     timestamp?: string;
   };
+  covmatrix?: any;
+  seasonality?: any;
 }

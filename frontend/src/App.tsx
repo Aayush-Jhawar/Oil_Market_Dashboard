@@ -2,23 +2,22 @@ import { useEffect, useState } from 'react'
 import axios from 'axios'
 import { useDashboardStore } from './store/useStore'
 import type { DashboardTab } from './types'
-import { connectWebSocket } from './store/dashboardStore'
 import HeaderBar from './components/Header/HeaderBar'
 import AlertStrip from './components/AlertStrip'
 import SettingsPanel from './components/Settings/SettingsPanel'
-import SnapshotPreview from './components/SnapshotPreview'
-import './store/snapshotMapper'
 import OverviewTab from './tabs/OverviewTab'
 import PricesTab from './tabs/PricesTab'
-import MarketStructureTab from './tabs/MarketStructureTab'
-import SeasonalityTab from './tabs/SeasonalityTab'
+import { PredictionTab } from './tabs/PredictionTab'
 import NewsTab from './tabs/NewsTab'
 import AnchorDataTab from './tabs/AnchorDataTab'
-import ProToolsTab from './tabs/ProToolsTab'
 import SpreadsPanel from './components/SpreadsPanel'
+import PortfolioTab from './tabs/PortfolioTab'
+// import BacktestTab from './tabs/BacktestTab' // re-enable alongside the commented backtest tab below
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
-const api = axios.create({ baseURL: API_BASE, timeout: 15000 })
+// In dev, use relative URLs so Vite's proxy forwards /api/* to localhost:8000.
+// In production (when VITE_API_BASE is set), use the full base URL.
+const API_BASE = import.meta.env.VITE_API_BASE ?? ''
+const api = axios.create({ baseURL: API_BASE, timeout: 90000 })
 
 function App() {
   const { activeTab, setActiveTab } = useDashboardStore((state) => ({
@@ -27,6 +26,13 @@ function App() {
   }))
   const [showSettings, setShowSettings] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
+
+  useEffect(() => {
+    // Dynamically import and connect WebSocket to avoid top-level side effects
+    import('./store/dashboardStore').then(({ connectWebSocket }) => {
+      connectWebSocket(API_BASE)
+    })
+  }, [])
 
   const {
     setPrices,
@@ -38,17 +44,13 @@ function App() {
     setRigs,
     setCFTC,
     setEIAData,
+    setEIAStatus,
+    setCFTCStatus,
     setForwardCurve,
     setAnalytics,
     setEnhancedSignals,
     setIndicators,
   } = useDashboardStore()
-
-  // start websocket connection to populate `snapshot` (simulated backend)
-  useEffect(() => {
-    const ws = connectWebSocket()
-    return () => ws.close()
-  }, [])
 
   useEffect(() => {
     const fetchDashboard = async () => {
@@ -91,12 +93,19 @@ function App() {
           setMacro(macroRes.value.data.data)
         }
 
-        if (eiaRes.status === 'fulfilled' && eiaRes.value.data?.data) {
+        if (eiaRes.status === 'fulfilled' && eiaRes.value.data?.data && Object.keys(eiaRes.value.data.data).length > 0) {
           setEIAData(eiaRes.value.data.data)
+          setEIAStatus('ready')
+        } else {
+          // Request resolved with no usable payload, or the call itself rejected.
+          setEIAStatus('unavailable')
         }
 
-        if (cftcRes.status === 'fulfilled' && cftcRes.value.data?.data) {
+        if (cftcRes.status === 'fulfilled' && cftcRes.value.data?.data && cftcRes.value.data.data.WTI) {
           setCFTC(cftcRes.value.data.data)
+          setCFTCStatus('ready')
+        } else {
+          setCFTCStatus('unavailable')
         }
 
         if (rigsRes.status === 'fulfilled' && rigsRes.value.data?.data) {
@@ -119,7 +128,7 @@ function App() {
           setIndicators(indicatorsRes.value.data.data)
         }
 
-        const historySymbols = ['WTI', 'Brent', 'RBOB', 'HO', 'GO', 'HH']
+        const historySymbols = ['WTI', 'Brent', 'RBOB', 'HO', 'GO', 'NG', '3-2-1CRACK', 'GASCRACK', 'DIESELCRACK', 'WTI-Brent', 'WTI_CAL_SPREAD', 'BRENT_CAL_SPREAD', 'WTI_FLY', 'BRENT_FLY', 'HO_FLY']
         await Promise.allSettled(
           historySymbols.map(async (symbol) => {
             try {
@@ -150,6 +159,8 @@ function App() {
     setRigs,
     setCFTC,
     setEIAData,
+    setEIAStatus,
+    setCFTCStatus,
     setForwardCurve,
     setAnalytics,
     setEnhancedSignals,
@@ -170,12 +181,12 @@ function App() {
             {([
               { id: 'overview' as DashboardTab, label: 'Overview' },
               { id: 'prices' as DashboardTab, label: 'Prices' },
-              { id: 'market' as DashboardTab, label: 'Market' },
-              { id: 'forward' as DashboardTab, label: 'Forward' },
               { id: 'spreads' as DashboardTab, label: 'Spreads' },
               { id: 'news' as DashboardTab, label: 'News' },
               { id: 'anchor' as DashboardTab, label: 'EIA Anchors' },
-              { id: 'protools' as DashboardTab, label: 'Pro Tools' },
+              { id: 'prediction' as DashboardTab, label: 'Predictions' },
+              // { id: 'backtest' as DashboardTab, label: 'Backtest' },
+              { id: 'portfolio' as DashboardTab, label: 'Risk & Portfolio' },
             ] as Array<{ id: DashboardTab; label: string }> ).map((tab) => (
               <button
                 key={tab.id}
@@ -196,10 +207,6 @@ function App() {
           <AlertStrip />
         </div>
 
-        <div className="mb-6">
-          <SnapshotPreview />
-        </div>
-
         {isLoading ? (
           <div className="flex h-96 items-center justify-center">
             <div className="text-slate-400">Loading dashboard...</div>
@@ -215,18 +222,6 @@ function App() {
             {activeTab === 'prices' && (
               <div className="space-y-6">
                 <PricesTab />
-              </div>
-            )}
-
-            {activeTab === 'market' && (
-              <div className="space-y-6">
-                <MarketStructureTab />
-              </div>
-            )}
-
-            {activeTab === 'forward' && (
-              <div className="space-y-6">
-                <SeasonalityTab />
               </div>
             )}
 
@@ -248,9 +243,23 @@ function App() {
               </div>
             )}
 
-            {activeTab === 'protools' && (
+            {activeTab === 'prediction' && (
               <div className="space-y-6">
-                <ProToolsTab />
+                <PredictionTab />
+              </div>
+            )}
+
+
+
+            {/* activeTab === 'backtest' && (
+              <div className="space-y-6">
+                <BacktestTab />
+              </div>
+            ) */}
+
+            {activeTab === 'portfolio' && (
+              <div className="space-y-6">
+                <PortfolioTab />
               </div>
             )}
           </>

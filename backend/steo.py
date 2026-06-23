@@ -1,39 +1,137 @@
-"""Minimal STEO balance fetcher (simulated).
+"""EIA Short-Term Energy Outlook (STEO) — global oil supply/demand balance.
 
-Returns a small structure matching the spec but with placeholder values.
-"""
+STEO is the benchmark global oil balance that every analyst reads. It's
+published monthly (around the 10th) and includes:
+
+- World petroleum + other-liquids production (M bpd)
+- World petroleum + other-liquids consumption (M bpd)
+- OPEC vs non-OPEC supply split
+- OECD vs non-OECD demand split
+- ~18 months of forward forecast
+
+The implied global stock change is **supply − demand** — positive = surplus
+(stocks build, bearish for prices), negative = deficit (stocks draw,
+bullish). IEA and OPEC publish their own balances; STEO is the free one
+and is updated first.
+
+This sits in the same EIA v2 API as the weekly fundamentals — uses the
+same EIA_API_KEY."""
 from __future__ import annotations
 
-from typing import Dict, Any
-import datetime
+import datetime as dt
+from typing import Dict, List, Optional
+
+import httpx
+
+_BASE = "https://api.eia.gov/v2/seriesid"
+
+# Series IDs verified against live EIA API on 2026-05-28.
+# Naming convention: PAPR_* = production of total petroleum + liquids,
+# PATC_* = total consumption of petroleum + liquids. Units: million bbl/day.
+_SERIES = {
+    "world_supply":     "STEO.PAPR_WORLD.M",
+    "world_demand":     "STEO.PATC_WORLD.M",
+    "opec_supply":      "STEO.PAPR_OPEC.M",
+    "non_opec_supply":  "STEO.PAPR_NONOPEC.M",
+    "oecd_demand":      "STEO.PATC_OECD.M",
+    "non_oecd_demand":  "STEO.PATC_NON_OECD.M",   # note underscore — EIA's id
+}
+
+# 30 months covers ~12 historical + ~18 forecast at any publication date.
+_SERIES_LENGTH = 30
 
 
-def fetch_steo_balance() -> Dict[str, Any] | None:
-    # For now return a simple simulated series (monthly for next 12 months)
-    months = []
-    world_supply = []
-    world_demand = []
-    implied_balance = []
-    is_forecast = []
-    today = datetime.date.today()
-    for i in range(12):
-        m = (today.replace(day=1) + datetime.timedelta(days=30 * i)).strftime('%Y-%m')
-        months.append(m)
-        world_supply.append(100.0)  # mbpd
-        world_demand.append(99.5)
-        implied_balance.append(0.5)
-        is_forecast.append(i >= 0)
+async def _fetch_series(client: httpx.AsyncClient, api_key: str,
+                        series_id: str) -> List[Dict]:
+    try:
+        resp = await client.get(f"{_BASE}/{series_id}", params={
+            "api_key": api_key,
+            "length": str(_SERIES_LENGTH),
+            "sort[0][column]": "period",
+            "sort[0][direction]": "desc",
+        })
+        data = resp.json()
+    except Exception:
+        return []
+    return data.get("response", {}).get("data", []) or []
+
+
+def _to_series(rows: List[Dict]) -> List[Dict]:
+    """Convert EIA API rows (newest-first) → oldest-first list of
+    ``{period, value}`` records with safe float coercion."""
+    out: List[Dict] = []
+    for r in sorted(rows, key=lambda r: r.get("period", "")):
+        try:
+            out.append({"period": r["period"],
+                        "value": round(float(r["value"]), 3)})
+        except (KeyError, ValueError, TypeError):
+            continue
+    return out
+
+
+async def fetch_steo(api_key: str) -> Optional[Dict]:
+    """Pull STEO balance series. Returns ``None`` on any failure so the
+    caller can fall back cleanly (no synthetic data injected)."""
+    if not api_key:
+        return None
+
+    raw: Dict[str, List[Dict]] = {}
+    # EIA API frequently takes 10-30s per request. With 6 series to fetch
+    # sequentially, total can be 1-2 minutes when EIA is slow. Per-request
+    # timeout (not total) — 60s gives EIA 3-4x its normal response time.
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for key, series_id in _SERIES.items():
+                rows = await _fetch_series(client, api_key, series_id)
+                if rows:
+                    raw[key] = _to_series(rows)
+    except Exception:
+        return None
+
+    if "world_supply" not in raw or "world_demand" not in raw:
+        return None
+
+    # Compute the implied stock change month-by-month on dates that exist
+    # in BOTH supply and demand series (forecasts usually align, but
+    # publication-date drift can desync them by a month).
+    sup = {r["period"]: r["value"] for r in raw["world_supply"]}
+    dem = {r["period"]: r["value"] for r in raw["world_demand"]}
+    periods = sorted(set(sup) & set(dem))
+
+    today_month = dt.date.today().strftime("%Y-%m")
+    balance: List[Dict] = []
+    for p in periods:
+        balance.append({
+            "period": p,
+            "supply": sup[p],
+            "demand": dem[p],
+            "balance": round(sup[p] - dem[p], 3),    # supply - demand
+            "is_forecast": p >= today_month,
+        })
+
+    historical = [b for b in balance if not b["is_forecast"]]
+    forecast = [b for b in balance if b["is_forecast"]]
+
+    # Current/headline reading = latest historical month if we have one,
+    # otherwise the earliest forecast month.
+    headline = historical[-1] if historical else (
+        forecast[0] if forecast else None)
+
+    # 6- and 12-month forward forecast averages — what STEO is forecasting
+    # the market to look like, in one number.
+    def avg_balance(items: List[Dict]) -> Optional[float]:
+        vals = [it["balance"] for it in items]
+        return round(sum(vals) / len(vals), 3) if vals else None
 
     return {
-        "months": months,
-        "world_supply": world_supply,
-        "world_demand": world_demand,
-        "implied_balance": implied_balance,
-        "opec_supply": [30.0] * 12,
-        "nonopec_supply": [70.0] * 12,
-        "oecd_demand": [50.0] * 12,
-        "non_oecd_demand": [50.0] * 12,
-        "is_forecast": is_forecast,
-        "fwd_6m_avg": sum(implied_balance[:6]) / 6,
-        "fwd_12m_avg": sum(implied_balance) / 12,
+        "balance": balance,
+        "headline": headline,
+        "fwd6_avg_balance":  avg_balance(forecast[:6]),
+        "fwd12_avg_balance": avg_balance(forecast[:12]),
+        "opec_supply":     raw.get("opec_supply", []),
+        "non_opec_supply": raw.get("non_opec_supply", []),
+        "oecd_demand":     raw.get("oecd_demand", []),
+        "non_oecd_demand": raw.get("non_oecd_demand", []),
+        "source": ("EIA Short-Term Energy Outlook (monthly, ~18mo "
+                   "forecast horizon)"),
     }

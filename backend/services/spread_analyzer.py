@@ -33,26 +33,18 @@ class SpreadCalculator:
             "importance": 0.85
         },
         
-        # Crack spreads (refinery margins)
+        # Crack spreads (refinery margins in USD/bbl)
         "3-2-1CRACK": {
-            "formula": "3*Brent - 2*RBOB - 1*HO",
-            "components": [("Brent", 3), ("RBOB", -2), ("HO", -1)],
+            "formula": "(2*RBOB + 1*HO)/3 - Brent",
+            "components": [("RBOB", 2.0/3.0), ("HO", 1.0/3.0), ("Brent", -1.0)],
             "unit": "USD/bbl",
             "description": "3-2-1 Crack Spread (Brent basis)",
-            "importance": 0.98,
-            "multiplier": 42  # Convert to per barrel
+            "importance": 0.98
         },
-        "2-1-1CRACK": {
-            "formula": "2*Brent - 1*RBOB - 1*HO",
-            "components": [("Brent", 2), ("RBOB", -1), ("HO", -1)],
-            "unit": "USD/bbl",
-            "description": "2-1-1 Crack Spread (Brent basis)",
-            "importance": 0.95,
-            "multiplier": 42
-        },
+
         "WTI-CRACK": {
-            "formula": "WTI - RBOB*0.42 - HO*0.58",
-            "components": [("WTI", 1), ("RBOB", -0.42), ("HO", -0.58)],
+            "formula": "0.42*RBOB + 0.58*HO - WTI",
+            "components": [("RBOB", 0.42), ("HO", 0.58), ("WTI", -1.0)],
             "unit": "USD/bbl",
             "description": "WTI Crack Spread",
             "importance": 0.92,
@@ -61,21 +53,22 @@ class SpreadCalculator:
         # Product spreads
         "GASCRACK": {
             "formula": "RBOB - WTI",
-            "components": [("RBOB", 1), ("WTI", -1)],
+            "components": [("RBOB", 1.0), ("WTI", -1.0)],
             "unit": "USD/bbl",
             "description": "Gasoline Crack",
             "importance": 0.90
         },
         "DIESELCRACK": {
             "formula": "HO - WTI",
-            "components": [("HO", 1), ("WTI", -1)],
+            "components": [("HO", 1.0), ("WTI", -1.0)],
             "unit": "USD/bbl",
             "description": "Diesel Crack",
             "importance": 0.90
         },
         "FRAC": {
             "formula": "HO/HH ratio",
-            "components": [("HO", 1), ("HH", -1)],
+            "components": [("HO", 1), ("HH", 1)],
+            "type": "ratio",
             "unit": "ratio",
             "description": "Heating Oil / Natural Gas Ratio",
             "importance": 0.75
@@ -112,29 +105,73 @@ class SpreadCalculator:
             return None
         
         definition = self.SPREAD_DEFINITIONS[spread_name]
-        spread_value = 0.0
+        spread_type = definition.get("type", "linear")
         
-        for symbol, weight in definition["components"]:
-            price_entry = prices.get(symbol)
-            if price_entry is None:
-                logger.warning(f"Missing price for {symbol} in spread {spread_name}")
+        if spread_type == "ratio":
+            # Assume exact 2 components for ratio: A / B
+            comp1_sym = definition["components"][0][0]
+            comp2_sym = definition["components"][1][0]
+            
+            p1 = prices.get(comp1_sym)
+            p1 = p1.get("close") if isinstance(p1, dict) else p1
+            p2 = prices.get(comp2_sym)
+            p2 = p2.get("close") if isinstance(p2, dict) else p2
+            
+            if p1 is None or p2 is None or p2 == 0:
                 return None
-            price = price_entry.get("close") if isinstance(price_entry, dict) else price_entry
-            if price is None:
-                logger.warning(f"Missing close price for {symbol} in spread {spread_name}")
-                return None
-            spread_value += price * weight
-        
-        # Apply multiplier if defined (e.g., for crack spreads)
-        if "multiplier" in definition:
-            spread_value *= definition["multiplier"]
+                
+            spread_value = p1 / p2
+        else:
+            spread_value = 0.0
+            for symbol, weight in definition["components"]:
+                price_entry = prices.get(symbol)
+                if price_entry is None:
+                    logger.debug(f"Missing price for {symbol} in spread {spread_name}")
+                    return None
+                price = price_entry.get("close") if isinstance(price_entry, dict) else price_entry
+                if price is None:
+                    logger.debug(f"Missing close price for {symbol} in spread {spread_name}")
+                    return None
+                spread_value += price * weight
+            
+            # Apply multiplier if defined (e.g., for crack spreads)
+            if "multiplier" in definition:
+                spread_value *= definition["multiplier"]
         
         return spread_value
 
-    def calculate_all_spreads(self, prices: Dict[str, float]) -> Dict[str, Dict]:
+    def calculate_all_spreads(self, prices: Dict[str, Dict]) -> Dict[str, Dict]:
         """Calculate all spreads and their statistics"""
         spreads = {}
         
+        # Pull Kalman Z-Scores from trade_recommendations
+        kalman_zscores = {}
+        try:
+            import sqlite3
+            import json
+            import os
+            db_path = os.path.join(os.path.dirname(__file__), "..", "energy.db")
+            if os.path.exists(db_path):
+                conn = sqlite3.connect(db_path)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT symbol, explanation_json FROM trade_recommendations WHERE created_at >= datetime('now', '-1 day') ORDER BY created_at DESC"
+                )
+                rows = cursor.fetchall()
+                for row in rows:
+                    sym, explanation = row
+                    if sym not in kalman_zscores and explanation:
+                        try:
+                            exp_data = json.loads(explanation)
+                            if "rationale" in exp_data and "Z-Score:" in exp_data["rationale"]:
+                                z_str = exp_data["rationale"].split("Z-Score:")[1].split()[0]
+                                kalman_zscores[sym] = float(z_str)
+                        except Exception:
+                            pass
+                conn.close()
+        except Exception as e:
+            logger.error(f"Error pulling Kalman z-scores: {e}")
+            
         for spread_name in self.SPREAD_DEFINITIONS:
             value = self.calculate_spread(spread_name, prices)
             
@@ -160,6 +197,12 @@ class SpreadCalculator:
                 }
             else:
                 stats = self._calculate_statistics(value, hist_values, spread_name)
+                
+            # Overwrite naive Z-score with Kalman Filter Z-score if available
+            if spread_name in kalman_zscores:
+                stats["zscore_5d"] = kalman_zscores[spread_name]
+            elif spread_name == "GASCRACK" and "GASCRACK" in kalman_zscores:
+                 stats["zscore_5d"] = kalman_zscores["GASCRACK"]
             
             spreads[spread_name] = stats
         
@@ -196,7 +239,7 @@ class SpreadCalculator:
                 stats[f"std_{period_name}"] = std
                 
                 # Z-score: (value - mean) / std
-                if std > 0:
+                if std > 1e-6:
                     zscore = (current_value - mean) / std
                 else:
                     zscore = 0.0

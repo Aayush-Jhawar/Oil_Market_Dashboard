@@ -62,75 +62,18 @@ class SentimentAnalyzer:
     @staticmethod
     def analyze_finbert(text: str) -> Tuple[float, str]:
         """
-        Use FinBERT from Hugging Face for financial sentiment
+        Use local FinBERT model for financial sentiment
         Returns: (score -1 to 1, label)
         """
-        hf_token = os.getenv("HF_API_KEY")
-        if not hf_token:
-            logger.warning("HF_API_KEY not set for FinBERT analysis")
-            return 0.0, "neutral"
-
         try:
-            API_URL = "https://api-inference.huggingface.co/models/ProsusAI/finbert"
-            headers = {"Authorization": f"Bearer {hf_token}"}
-            
-            # Truncate to 512 tokens max for model
-            truncated_text = text[:512]
-            response = requests.post(
-                API_URL,
-                headers=headers,
-                json={"inputs": truncated_text},
-                timeout=10,
-            )
-
-            if response.status_code != 200:
-                # Handle rate limiting and service errors gracefully
-                if response.status_code in (429, 503):
-                    logger.warning(f"FinBERT service rate-limited or unavailable: {response.status_code}")
-                else:
-                    logger.error(f"FinBERT returned status {response.status_code}: {response.text}")
-                return 0.0, "neutral"
-
-            results = response.json()
-            # Hugging Face inference can return either:
-            # - a list of label dicts: [{"label": "POSITIVE", "score": 0.9}, ...]
-            # - or a list containing a list of dicts in some provider wrappers: [[{...}]]
-            # Normalize to a flat list of {label, score}
-            flat = []
-            if isinstance(results, list) and results:
-                if isinstance(results[0], dict) and "label" in results[0]:
-                    flat = results
-                elif isinstance(results[0], list):
-                    # nested list
-                    for item in results[0]:
-                        if isinstance(item, dict) and "label" in item:
-                            flat.append(item)
-            elif isinstance(results, dict):
-                # Some wrappers return a dict with scores
-                if "scores" in results and isinstance(results["scores"], list):
-                    flat = [s for s in results["scores"] if isinstance(s, dict) and "label" in s]
-
-            if flat:
-                scores = {item["label"].lower(): float(item.get("score", 0.0)) for item in flat}
-
-                positive = scores.get("positive", 0.0)
-                negative = scores.get("negative", 0.0)
-                neutral = scores.get("neutral", 0.0)
-
-                # Convert to -1 to 1 scale
-                score = positive - negative
-
-                if positive > 0.5:
-                    return score, "positive"
-                elif negative > 0.5:
-                    return score, "negative"
-                else:
-                    return 0.0, "neutral"
-        except requests.exceptions.Timeout:
-            logger.warning("FinBERT request timeout")
+            from sentiment import classify_finbert
+            result = classify_finbert(text)
+            if result:
+                # result is {"compound": float, "label": str, ...}
+                return float(result.get("compound", 0.0)), result.get("label", "neutral")
         except Exception as e:
-            logger.error(f"FinBERT analysis error: {e}")
-
+            logger.error(f"Local FinBERT analysis error: {e}")
+        
         return 0.0, "neutral"
 
     @staticmethod
@@ -191,7 +134,12 @@ class SentimentAnalyzer:
         total_keywords = bearish_count + bullish_count
         
         # Calculate weighted sentiment (average of VADER and FinBERT)
-        combined_score = (vader_score * 0.4 + finbert_score * 0.6)
+        from sentiment import finbert_ready
+        if finbert_ready():
+            combined_score = (vader_score * 0.4 + finbert_score * 0.6)
+        else:
+            combined_score = vader_score
+        
         
         # Boost for energy-specific keywords
         if total_keywords > 0:
