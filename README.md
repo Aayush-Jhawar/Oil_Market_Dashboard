@@ -1,6 +1,5 @@
 ---
 title: Oil Market Dashboard
-emoji: 🛢️
 colorFrom: blue
 colorTo: gray
 sdk: docker
