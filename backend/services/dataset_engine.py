@@ -10,14 +10,19 @@ DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "
 class DatasetEngine:
     """Lazy evaluation query engine for high-frequency datasets using Polars."""
 
-    # Map standard symbols to their respective CSV files
+    # Map standard symbols
     SYMBOL_MAP = {
-        "WTI": "CL_data.csv",
-        "Brent": "LCO_data.csv",
-        "HO": "HO_data.csv",
-        "Gasoil": "LGO_data.csv",
-        "WTI-BRENT": "wtcl_lco_outrights_1min.csv"
+        "WTI": "CL_data.parquet",
+        "Brent": "LCO_data.parquet",
+        "HO": "HO_data.parquet",
+        "GO": "LGO_data.parquet",
+        "WTI-Brent": "wtcl_lco_outrights_1min.parquet"
     }
+    
+    # fallback to .csv if parquet doesn't exist
+    for key, val in SYMBOL_MAP.items():
+        if not os.path.exists(os.path.join(DATA_DIR, val)):
+            SYMBOL_MAP[key] = val.replace(".parquet", ".csv")
 
     @staticmethod
     def get_file_path(symbol: str) -> str:
@@ -40,9 +45,12 @@ class DatasetEngine:
             
             # The CSVs have a comment header on line 1, column names on line 2.
             # Polars might struggle with the comment line `#meta:1min...`
-            # We skip the first row (skip_rows=1).
+            # We skip the first row (skip_rows=1) for CSVs.
             
-            lazy_df = pl.scan_csv(filepath, skip_rows=1)
+            if filepath.endswith('.parquet'):
+                lazy_df = pl.scan_parquet(filepath)
+            else:
+                lazy_df = pl.scan_csv(filepath, skip_rows=1)
             
             # The column names for timestamp and c1
             # "timestamp" and "c1||weighted_mid"

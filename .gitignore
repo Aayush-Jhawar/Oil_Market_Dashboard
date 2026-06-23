@@ -3,6 +3,7 @@ node_modules/
 .venv/
 __pycache__/
 *.pyc
+*.pyo
 env/
 venv/
 
@@ -26,27 +27,35 @@ build/
 *.swo
 *~
 .DS_Store
+Thumbs.db
 
-# Database — ignore all DBs EXCEPT the two snapshots we intentionally ship to
-# the HF Space. The Hub applies .gitignore server-side, so without these
-# negations the uploaded .db files are silently dropped from the commit.
+# Large data files — raw CSV sources, SQLite databases
 *.db
 *.sqlite
 *.sqlite3
 *.csv
 *.db-wal
 *.db-shm
+*.xlsx
+*.xls
 
 # Logs
 logs/
 *.log
 npm-debug.log*
 
-# OS
-.DS_Store
-Thumbs.db
-
-# Docker
-.dockerignore
-*.png
+# OS / Archive
 *.zip
+*.png
+
+# Dev/scratch scripts — not part of the public codebase
+_*.py
+convert_to_parquet.py
+analyze_endpoints.py
+auto_publish.py
+
+# Research journals (private)
+research_journals/
+
+# TypeScript build info
+*.tsbuildinfo

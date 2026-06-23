@@ -31,77 +31,55 @@ def get_best_dataset(pattern_list):
     return best_file
 
 def resample_1min_csv_to_daily(file_path, symbol_name):
-    """Resamples a 1-minute CSV file to daily OHLCV.
+    """Resamples a 1-minute dataset to daily OHLCV.
     Handles columns with and without volume.
     """
     logger.info(f"Resampling 1-minute dataset: {file_path} for symbol {symbol_name}")
     try:
-        # Read the first line to get columns
-        # Since files are large, we can read chunks
-        chunks = pd.read_csv(file_path, skiprows=1, chunksize=100000)
-        daily_dfs = []
-        
-        for chunk in chunks:
-            if chunk.empty:
-                continue
+        # Read the entire Parquet (or CSV) file
+        if file_path.endswith('.parquet'):
+            df = pd.read_parquet(file_path)
+        else:
+            df = pd.read_csv(file_path, skiprows=1)
             
-            chunk['timestamp'] = pd.to_datetime(chunk['timestamp'], errors='coerce')
-            chunk = chunk.dropna(subset=['timestamp'])
-            chunk['date'] = chunk['timestamp'].dt.strftime('%Y-%m-%d')
-            
-            # Identify columns for frontline contract (c1)
-            # Find weighted_mid and volume columns
-            price_col = None
-            vol_col = None
-            
-            for col in chunk.columns:
-                if 'c1||weighted_mid' in col:
-                    price_col = col
-                elif 'c1||volume' in col:
-                    vol_col = col
-            
-            if not price_col:
-                # If no c1||weighted_mid, check if it's the spread file
-                for col in chunk.columns:
-                    if 'c1||' in col and 'contract' not in col:
-                        price_col = col
-                        break
-            
-            if not price_col:
-                continue
-            
-            # Clean numeric values
-            chunk[price_col] = pd.to_numeric(chunk[price_col], errors='coerce')
-            if vol_col:
-                chunk[vol_col] = pd.to_numeric(chunk[vol_col], errors='coerce').fillna(0)
-            
-            # Group by date
-            grouped = chunk.groupby('date')
-            
-            # Calculate daily OHLCV
-            daily_chunk = grouped.agg(
-                open=(price_col, 'first'),
-                high=(price_col, 'max'),
-                low=(price_col, 'min'),
-                close=(price_col, 'last'),
-                volume=(vol_col, 'sum') if vol_col else (price_col, lambda x: 0.0)
-            )
-            daily_dfs.append(daily_chunk)
-            
-        if not daily_dfs:
+        if df.empty:
             return pd.DataFrame()
             
-        # Combine chunks
-        combined = pd.concat(daily_dfs)
-        # Re-aggregate combined daily results since a date could span across chunks
-        final_daily = combined.groupby(combined.index).agg({
-            'open': 'first',
-            'high': 'max',
-            'low': 'min',
-            'close': 'last',
-            'volume': 'sum'
-        })
+        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+        df = df.dropna(subset=['timestamp'])
+        df['date'] = df['timestamp'].dt.strftime('%Y-%m-%d')
         
+        # Identify columns
+        price_col = None
+        vol_col = None
+        for col in df.columns:
+            if 'c1||weighted_mid' in col:
+                price_col = col
+            elif 'c1||volume' in col:
+                vol_col = col
+                
+        if not price_col:
+            for col in df.columns:
+                if 'c1||' in col and 'contract' not in col:
+                    price_col = col
+                    break
+                    
+        if not price_col:
+            return pd.DataFrame()
+            
+        df[price_col] = pd.to_numeric(df[price_col], errors='coerce')
+        if vol_col:
+            df[vol_col] = pd.to_numeric(df[vol_col], errors='coerce').fillna(0)
+            
+        grouped = df.groupby('date')
+        
+        final_daily = grouped.agg(
+            open=(price_col, 'first'),
+            high=(price_col, 'max'),
+            low=(price_col, 'min'),
+            close=(price_col, 'last'),
+            volume=(vol_col, 'sum') if vol_col else (price_col, lambda x: 0.0)
+        )
         final_daily = final_daily.dropna(subset=['close'])
         
         # Unit Standardization
@@ -178,11 +156,11 @@ def load_full_1min_history(symbol_name: str) -> pd.DataFrame:
     Does NOT compress to daily. Used for high-frequency model training.
     """
     mapping = {
-        "WTI": ["CL_outrights_1min_t.csv", "CL_data.csv"],
-        "Brent": ["LCO_data.csv", "LCO_3_year_test.csv"],
-        "HO": ["HO_data.csv"],
-        "GO": ["LGO_data.csv"],
-        "WTI-Brent": ["wtcl_lco_outrights_1min.csv"],
+        "WTI": ["CL_outrights_1min_t.parquet", "CL_data.parquet", "CL_outrights_1min_t.csv", "CL_data.csv"],
+        "Brent": ["LCO_data.parquet", "LCO_3_year_test.parquet", "LCO_data.csv", "LCO_3_year_test.csv"],
+        "HO": ["HO_data.parquet", "HO_data.csv"],
+        "GO": ["LGO_data.parquet", "LGO_data.csv"],
+        "WTI-Brent": ["wtcl_lco_outrights_1min.parquet", "wtcl_lco_outrights_1min.csv"],
         # Synthetic spread symbols — computed from component CSVs below
         "DIESELCRACK": "__synthetic__",
         "WTI_CAL_SPREAD": "__synthetic__",
@@ -206,7 +184,11 @@ def load_full_1min_history(symbol_name: str) -> pd.DataFrame:
     logger.info(f"Loading full 1-minute history from {file_path} for {symbol_name}...")
     try:
         # Read the file
-        df = pd.read_csv(file_path, skiprows=1)
+        if file_path.endswith('.parquet'):
+            df = pd.read_parquet(file_path)
+        else:
+            df = pd.read_csv(file_path, skiprows=1)
+            
         if df.empty:
             return df
             
@@ -340,12 +322,12 @@ def populate_database_pipeline():
 
         logger.info("Initializing energy dashboard database with integrated datasets...")
         
-        # 1. Select files
-        wti_file = get_best_dataset(["CL_outrights_1min_t.csv", "CL_data.csv"])
-        brent_file = get_best_dataset(["LCO_data.csv", "LCO_3_year_test.csv"])
-        ho_file = get_best_dataset(["HO_data.csv"])
-        go_file = get_best_dataset(["LGO_data.csv"])
-        spread_file = get_best_dataset(["wtcl_lco_outrights_1min.csv"])
+        # 1. Select files (Parquet preferred via order)
+        wti_file = get_best_dataset(["CL_outrights_1min_t.parquet", "CL_data.parquet", "CL_outrights_1min_t.csv", "CL_data.csv"])
+        brent_file = get_best_dataset(["LCO_data.parquet", "LCO_3_year_test.parquet", "LCO_data.csv", "LCO_3_year_test.csv"])
+        ho_file = get_best_dataset(["HO_data.parquet", "HO_data.csv"])
+        go_file = get_best_dataset(["LGO_data.parquet", "LGO_data.csv"])
+        spread_file = get_best_dataset(["wtcl_lco_outrights_1min.parquet", "wtcl_lco_outrights_1min.csv"])
         
         dfs_to_combine = []
         
@@ -424,16 +406,15 @@ def populate_database_pipeline():
         db.close()
 
 def get_intraday_prices(symbol_name, max_points=1440):
-    """Retrieve the latest 1-minute intraday prices for a symbol from the CSV file.
-    Uses an optimized file read (tailing the file) to be fast.
+    """Retrieve the latest 1-minute intraday prices for a symbol.
+    Uses pandas to load parquet efficiently and tail the results.
     """
-    # Map symbols to CSVs
     mapping = {
-        "WTI": ["CL_outrights_1min_t.csv", "CL_data.csv"],
-        "Brent": ["LCO_data.csv", "LCO_3_year_test.csv"],
-        "HO": ["HO_data.csv"],
-        "GO": ["LGO_data.csv"],
-        "WTI-Brent": ["wtcl_lco_outrights_1min.csv"]
+        "WTI": ["CL_outrights_1min_t.parquet", "CL_data.parquet", "CL_outrights_1min_t.csv", "CL_data.csv"],
+        "Brent": ["LCO_data.parquet", "LCO_3_year_test.parquet", "LCO_data.csv", "LCO_3_year_test.csv"],
+        "HO": ["HO_data.parquet", "HO_data.csv"],
+        "GO": ["LGO_data.parquet", "LGO_data.csv"],
+        "WTI-Brent": ["wtcl_lco_outrights_1min.parquet", "wtcl_lco_outrights_1min.csv"]
     }
     
     candidates = mapping.get(symbol_name)
@@ -445,56 +426,40 @@ def get_intraday_prices(symbol_name, max_points=1440):
         return []
         
     try:
-        # Seek near the end of the file
-        # Each line is approx 150-300 bytes. To get ~2000 lines, seek back 600KB.
-        chunk_size = 800000
-        with open(file_path, 'rb') as f:
-            f.seek(0, 2) # seek to end
-            file_size = f.tell()
-            seek_pos = max(0, file_size - chunk_size)
-            f.seek(seek_pos)
-            bytes_data = f.read()
+        if file_path.endswith('.parquet'):
+            df = pd.read_parquet(file_path)
+        else:
+            df = pd.read_csv(file_path, skiprows=1)
             
-        text = bytes_data.decode('utf-8', errors='ignore')
-        lines = text.splitlines()
-        
-        # Discard first partial line
-        if len(lines) > 1 and seek_pos > 0:
-            lines = lines[1:]
+        df = df.tail(max_points)
             
         # Parse the headers to get column indexes
-        with open(file_path, 'r') as f:
-            f.readline() # Skip meta comment
-            header = f.readline().strip().split(',')
+        header = list(df.columns)
             
         price_idx = None
         vol_idx = None
         
         for idx, col in enumerate(header):
             if 'c1||weighted_mid' in col:
-                price_idx = idx
+                price_idx = col
             elif 'c1||volume' in col:
-                vol_idx = idx
+                vol_idx = col
                 
         if price_idx is None:
             for idx, col in enumerate(header):
                 if 'c1||' in col and 'contract' not in col:
-                    price_idx = idx
+                    price_idx = col
                     break
                     
         if price_idx is None:
             return []
             
         records = []
-        for line in lines[-max_points:]:
-            parts = line.strip().split(',')
-            if len(parts) <= max(price_idx, vol_idx or 0):
-                continue
-            
-            timestamp = parts[0]
+        for _, row in df.iterrows():
+            timestamp = str(row['timestamp'])
             try:
-                price = float(parts[price_idx])
-                volume = float(parts[vol_idx]) if vol_idx is not None and parts[vol_idx] else 0.0
+                price = float(row[price_idx])
+                volume = float(row[vol_idx]) if vol_idx and not pd.isna(row[vol_idx]) else 0.0
                 records.append({
                     "timestamp": timestamp,
                     "close": price,
@@ -510,13 +475,13 @@ def get_intraday_prices(symbol_name, max_points=1440):
         return []
 
 def get_intraday_curve(symbol_name: str) -> dict[str, float]:
-    """Retrieve the latest full curve (M1-M12) from the CSV dataset."""
+    """Retrieve the latest full curve (M1-M12) from the dataset."""
     mapping = {
-        "WTI": ["CL_outrights_1min_t.csv", "CL_data.csv"],
-        "Brent": ["LCO_data.csv", "LCO_3_year_test.csv"],
-        "HO": ["HO_data.csv"],
-        "GO": ["LGO_data.csv"],
-        "WTI-Brent": ["wtcl_lco_outrights_1min.csv"]
+        "WTI": ["CL_outrights_1min_t.parquet", "CL_data.parquet", "CL_outrights_1min_t.csv", "CL_data.csv"],
+        "Brent": ["LCO_data.parquet", "LCO_3_year_test.parquet", "LCO_data.csv", "LCO_3_year_test.csv"],
+        "HO": ["HO_data.parquet", "HO_data.csv"],
+        "GO": ["LGO_data.parquet", "LGO_data.csv"],
+        "WTI-Brent": ["wtcl_lco_outrights_1min.parquet", "wtcl_lco_outrights_1min.csv"]
     }
     
     candidates = mapping.get(symbol_name)
@@ -528,44 +493,37 @@ def get_intraday_curve(symbol_name: str) -> dict[str, float]:
         return {}
         
     try:
-        chunk_size = 100000
-        with open(file_path, 'rb') as f:
-            f.seek(0, 2)
-            file_size = f.tell()
-            seek_pos = max(0, file_size - chunk_size)
-            f.seek(seek_pos)
-            bytes_data = f.read()
+        if file_path.endswith('.parquet'):
+            df = pd.read_parquet(file_path)
+        else:
+            df = pd.read_csv(file_path, skiprows=1)
             
-        text = bytes_data.decode('utf-8', errors='ignore')
-        lines = text.splitlines()
-        
-        if len(lines) > 1 and seek_pos > 0:
-            lines = lines[1:]
+        if df.empty:
+            return {}
             
-        with open(file_path, 'r') as f:
-            f.readline()
-            header = f.readline().strip().split(',')
+        # Get the last row
+        last_row = df.iloc[-1]
+        header = list(df.columns)
             
-        # Map month to column index
-        month_to_idx = {}
+        # Map month to column name
+        month_to_col = {}
         for m in range(1, 13):
-            for idx, col in enumerate(header):
+            for col in header:
                 if f'c{m}||weighted_mid' in col:
-                    month_to_idx[m] = idx
+                    month_to_col[m] = col
                     break
                 elif f'c{m}||' in col and 'contract' not in col and 'volume' not in col:
                     # fallback
-                    month_to_idx[m] = idx
+                    month_to_col[m] = col
                     
-        if not month_to_idx:
+        if not month_to_col:
             return {}
             
-        last_line = lines[-1].strip().split(',')
         curve = {}
-        for m, idx in month_to_idx.items():
-            if idx < len(last_line):
+        for m, col in month_to_col.items():
+            if col in last_row:
                 try:
-                    val = float(last_line[idx])
+                    val = float(last_row[col])
                     if not math.isnan(val):
                         curve[f"M{m}"] = val
                 except ValueError:
