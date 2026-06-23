@@ -39,6 +39,13 @@ Thumbs.db
 *.xlsx
 *.xls
 
+# Exceptions: small, pre-built slim seed DBs shipped to Hugging Face so the
+# deployed dashboard works without the multi-GB raw data. Built locally by
+# _build_slim_db.py and _prep_deploy_db.py, committed so the GitHub Action can
+# ship them. Keep these tracked despite the *.db rule above.
+!backend/energy_deploy.db
+!DB/bars_15min_deploy.db
+
 # Logs
 logs/
 *.log

@@ -11,26 +11,79 @@ jobs:
   sync-to-hub:
     runs-on: ubuntu-latest
     steps:
+      # No LFS pull: the deployed Space runs off the committed slim seed DBs
+      # (backend/energy_deploy.db, DB/bars_15min_deploy.db), NOT the multi-GB
+      # raw parquet in Data/. Skipping LFS keeps the job fast and sidesteps the
+      # Git-LFS push problems entirely.
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          lfs: true
-          
-      - name: Install Python dependencies
-        run: pip install huggingface_hub
-      
-      - name: Push to Hugging Face via API
+          lfs: false
+
+      - name: Install Hugging Face Hub
+        run: pip install --upgrade huggingface_hub
+
+      - name: Deploy to Hugging Face Space
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          python -c "
+          python - <<'PY'
           import os
-          from huggingface_hub import HfApi
-          api = HfApi(token=os.environ['HF_TOKEN'])
+          from huggingface_hub import HfApi, CommitOperationAdd
+
+          REPO_ID = "YourGrimReaper/Oil-Market-Dashboard"
+          api = HfApi(token=os.environ["HF_TOKEN"])
+
+          # 1) Sync the application: code, config, frontend, README (with HF
+          #    front-matter so the Space builds as a Docker app on port 7860).
+          #    Exclude secrets, dev cruft, and ALL heavy raw data — the Space
+          #    runs off the slim seed DBs shipped in step 2.
+          #    delete_patterns purges heavy files previously uploaded to the
+          #    Space (e.g. the ~800MB Data/ parquet) so the image stays small.
           api.upload_folder(
-              folder_path='.',
-              repo_id='YourGrimReaper/Oil-Market-Dashboard',
-              repo_type='space',
-              ignore_patterns=['.git*', '.github*', '.venv*', '__pycache__*', '*.pyc']
+              folder_path=".",
+              repo_id=REPO_ID,
+              repo_type="space",
+              commit_message="CI: sync application (slim deploy)",
+              ignore_patterns=[
+                  ".git*", ".github*",
+                  ".venv*", "venv*", "**/venv/**", "**/.venv/**",
+                  "node_modules*", "**/node_modules/**",
+                  "**/__pycache__/**", "*.pyc", "*.pyo",
+                  "*.parquet", "*.csv", "*.db", "*.db-wal", "*.db-shm",
+                  "*.xlsx", "*.xls", "*.zip", "*.png", "*.log",
+                  "Data/*", "Data/**", "Papers/*", "Papers/**",
+                  "research_journals/*", "research_journals/**",
+                  ".env", "**/.env", "backend/.env",
+              ],
+              delete_patterns=[
+                  "Data/*", "Data/**", "*.parquet", "**/*.parquet",
+                  "Papers/*", "Papers/**",
+              ],
           )
-          "
+
+          # 2) Ship the small pre-built seed DBs to their runtime paths so the
+          #    dashboard works without the raw data:
+          #      backend/energy_deploy.db -> backend/energy.db   (history/charts)
+          #      DB/bars_15min_deploy.db  -> DB/bars_15min_latest.db (live + paper)
+          seed = {
+              "backend/energy_deploy.db": "backend/energy.db",
+              "DB/bars_15min_deploy.db": "DB/bars_15min_latest.db",
+          }
+          ops = []
+          for local, remote in seed.items():
+              if not os.path.exists(local):
+                  raise SystemExit(f"ERROR: required seed DB missing in repo: {local}")
+              mb = round(os.path.getsize(local) / 1024 / 1024, 2)
+              print(f"shipping {local} -> {remote} ({mb} MB)")
+              with open(local, "rb") as f:
+                  ops.append(CommitOperationAdd(path_in_repo=remote, path_or_fileobj=f.read()))
+
+          api.create_commit(
+              repo_id=REPO_ID,
+              repo_type="space",
+              operations=ops,
+              commit_message="CI: ship slim seed DBs (energy.db, bars_15min_latest.db)",
+          )
+          print("Deploy complete:", f"https://huggingface.co/spaces/{REPO_ID}")
+          PY
