@@ -11,105 +11,37 @@ jobs:
   sync-to-hub:
     runs-on: ubuntu-latest
     steps:
-      # No LFS pull: the deployed Space runs off the committed slim seed DBs
-      # (backend/energy_deploy.db, DB/bars_15min_deploy.db), NOT the multi-GB
-      # raw parquet in Data/. Skipping LFS keeps the job fast and sidesteps the
-      # Git-LFS push problems entirely.
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          lfs: false
-
-      - name: Install Hugging Face Hub
-        run: pip install --upgrade huggingface_hub
-
-      - name: Deploy to Hugging Face Space
+          lfs: true
+          
+      - name: Install Python dependencies
+        run: pip install huggingface_hub
+      
+      - name: Push to Hugging Face via API
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          python - <<'PY'
+          python -c "
           import os
-          import re
-          from huggingface_hub import HfApi, CommitOperationAdd
-
-          REPO_ID = "YourGrimReaper/Oil-Market-Dashboard"
-          api = HfApi(token=os.environ["HF_TOKEN"])
-
-          # Hugging Face Space config. This MUST be the first thing in the
-          # Space's README.md, but we keep it OUT of the repo README (where
-          # GitHub would render it as an ugly table) and inject it only here,
-          # at deploy time. So GitHub stays clean; the Space gets valid config.
-          HF_FRONT_MATTER = (
-              "---\n"
-              "title: Oil Market Dashboard\n"
-              "emoji: 🛢️\n"
-              "colorFrom: blue\n"
-              "colorTo: gray\n"
-              "sdk: docker\n"
-              "app_port: 7860\n"
-              "pinned: false\n"
-              "---\n\n"
-          )
-
-          # 1) Sync the application: code, config, frontend. Exclude secrets,
-          #    dev cruft, and ALL heavy raw data — the Space runs off the slim
-          #    seed DBs shipped in step 2. README.md is excluded here and added
-          #    in step 2 with the HF front-matter prepended.
-          #    delete_patterns purges heavy files previously uploaded to the
-          #    Space (e.g. the ~800MB Data/ parquet) so the image stays small.
+          from huggingface_hub import HfApi
+          api = HfApi(token=os.environ['HF_TOKEN'])
+          
+          print('Uploading full workspace...')
           api.upload_folder(
-              folder_path=".",
-              repo_id=REPO_ID,
-              repo_type="space",
-              commit_message="CI: sync application (slim deploy)",
-              ignore_patterns=[
-                  ".git*", ".github*",
-                  ".venv*", "venv*", "**/venv/**", "**/.venv/**",
-                  "node_modules*", "**/node_modules/**",
-                  "**/__pycache__/**", "*.pyc", "*.pyo",
-                  "*.parquet", "*.csv", "*.db", "*.db-wal", "*.db-shm",
-                  "*.xlsx", "*.xls", "*.zip", "*.png", "*.log",
-                  "Data/*", "Data/**", "Papers/*", "Papers/**",
-                  "research_journals/*", "research_journals/**",
-                  ".env", "**/.env", "backend/.env",
-                  "README.md",
-              ],
-              delete_patterns=[
-                  "Data/*", "Data/**", "*.parquet", "**/*.parquet",
-                  "Papers/*", "Papers/**",
-              ],
+              folder_path='.',
+              repo_id='YourGrimReaper/Oil-Market-Dashboard',
+              repo_type='space',
+              ignore_patterns=['.git*', '.github*', '.venv*', '__pycache__*', '*.pyc']
           )
-
-          # 2) Ship the slim seed DBs (so the dashboard works without the raw
-          #    data) and the README with HF front-matter injected, in one commit:
-          #      backend/energy_deploy.db -> backend/energy.db   (history/charts)
-          #      DB/bars_15min_deploy.db  -> DB/bars_15min_latest.db (live + paper)
-          ops = []
-          seed = {
-              "backend/energy_deploy.db": "backend/energy.db",
-              "DB/bars_15min_deploy.db": "DB/bars_15min_latest.db",
-          }
-          for local, remote in seed.items():
-              if not os.path.exists(local):
-                  raise SystemExit(f"ERROR: required seed DB missing in repo: {local}")
-              mb = round(os.path.getsize(local) / 1024 / 1024, 2)
-              print(f"shipping {local} -> {remote} ({mb} MB)")
-              with open(local, "rb") as f:
-                  ops.append(CommitOperationAdd(path_in_repo=remote, path_or_fileobj=f.read()))
-
-          # README: strip any stray leading front-matter, then prepend HF's.
-          with open("README.md", "r", encoding="utf-8") as f:
-              body = f.read()
-          body = re.sub(r"^﻿?---\r?\n.*?\r?\n---\r?\n", "", body, count=1, flags=re.S)
-          readme = HF_FRONT_MATTER + body.lstrip("\n")
-          ops.append(CommitOperationAdd(path_in_repo="README.md",
-                                        path_or_fileobj=readme.encode("utf-8")))
-
-          api.create_commit(
-              repo_id=REPO_ID,
-              repo_type="space",
-              operations=ops,
-              commit_message="CI: ship slim seed DBs + README with HF front-matter",
-          )
-          print("Deploy complete:", f"https://huggingface.co/spaces/{REPO_ID}")
-          PY
+          
+          print('Force uploading DB file bypassing gitignore...')
+          if os.path.exists('DB/bars_15min_latest.db'):
+              api.upload_file(
+                  path_or_fileobj='DB/bars_15min_latest.db',
+                  path_in_repo='DB/bars_15min_latest.db',
+                  repo_id='YourGrimReaper/Oil-Market-Dashboard',
+                  repo_type='space'
+              )
+          "
