@@ -29,13 +29,8 @@ build/
 .DS_Store
 Thumbs.db
 
-# Large data files — raw CSV sources, SQLite databases
-*.db
-*.sqlite
-*.sqlite3
+# Large data files — raw CSV sources
 *.csv
-*.db-wal
-*.db-shm
 *.xlsx
 *.xls
 

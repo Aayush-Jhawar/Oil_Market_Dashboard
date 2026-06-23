@@ -14,34 +14,17 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          lfs: true
-          
-      - name: Install Python dependencies
-        run: pip install huggingface_hub
+          fetch-depth: 1
+          lfs: false
       
-      - name: Push to Hugging Face via API
+      - name: Fetch Current LFS Objects
+        run: git lfs pull
+      
+      - name: Push to Hugging Face
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          python -c "
-          import os
-          from huggingface_hub import HfApi
-          api = HfApi(token=os.environ['HF_TOKEN'])
-          
-          print('Uploading full workspace...')
-          api.upload_folder(
-              folder_path='.',
-              repo_id='YourGrimReaper/Oil-Market-Dashboard',
-              repo_type='space',
-              ignore_patterns=['.git*', '.github*', '.venv*', '__pycache__*', '*.pyc']
-          )
-          
-          print('Force uploading DB file bypassing gitignore...')
-          if os.path.exists('DB/bars_15min_latest.db'):
-              api.upload_file(
-                  path_or_fileobj='DB/bars_15min_latest.db',
-                  path_in_repo='DB/bars_15min_latest.db',
-                  repo_id='YourGrimReaper/Oil-Market-Dashboard',
-                  repo_type='space'
-              )
-          "
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          git remote add hf https://YourGrimReaper:$HF_TOKEN@huggingface.co/spaces/YourGrimReaper/Oil-Market-Dashboard
+          git push hf main --force
