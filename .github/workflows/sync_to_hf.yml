@@ -27,4 +27,5 @@ jobs:
           git checkout --orphan deploy
           git add -A
           git commit -m "Auto-deploy to Hugging Face"
-          git push hf deploy:main --force
+          git lfs push hf deploy
+          git push hf deploy:main --force --no-verify
