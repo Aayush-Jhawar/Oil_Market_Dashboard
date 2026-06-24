@@ -69,10 +69,10 @@ export default function HeaderBar(_props: HeaderBarProps) {
   ]
 
   return (
-    <div className="fixed top-0 left-0 right-0 h-12 bg-energy-header border-b border-energy-border z-[1000] flex items-center px-6 justify-between">
-      <div className="flex items-center gap-4 flex-1 overflow-hidden">
+    <div className="fixed top-0 left-0 right-0 h-12 bg-energy-header border-b border-energy-border z-[1000] flex items-center px-3 justify-between">
+      <div className="flex items-center gap-2 flex-1 overflow-hidden">
         {/* Vol Regime */}
-        <div className={`shrink-0 px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wide ${
+        <div className={`shrink-0 px-2.5 py-1 rounded-full text-xs font-bold uppercase tracking-wide ${
           signals?.vol_regime === 'LOW' ? 'bg-blue-950 text-energy-accent-blue' :
           signals?.vol_regime === 'ELEVATED' ? 'bg-energy-amber-dim text-energy-amber' :
           'bg-energy-bear-dim text-energy-bear'
@@ -83,21 +83,21 @@ export default function HeaderBar(_props: HeaderBarProps) {
         <div className="border-l border-energy-border h-6 shrink-0"></div>
 
         {/* Price Pills */}
-        <div className="flex gap-6 text-xs overflow-x-auto whitespace-nowrap hide-scrollbar flex-1 pb-1 pt-1">
+        <div className="flex gap-1.5 text-xs whitespace-nowrap flex-1 min-w-0">
           {assets.map(asset => {
             const rd = getRegimeDisplay(asset.key)
             return (
-              <div key={asset.label} className="flex items-center gap-2 shrink-0 bg-slate-900/40 px-2 py-1 rounded">
+              <div key={asset.label} className="flex items-center gap-1.5 min-w-0 flex-1 bg-slate-900/40 px-1.5 py-1 rounded">
                 <span className="text-energy-text-secondary font-semibold">{asset.label}</span>
                 <span className="font-mono">{formatPrice(asset.val?.close, asset.unit)}</span>
                 {formatChange(asset.val?.change_pct)}
-                <span className={`text-[10px] px-1.5 py-0.5 rounded ${rd.color}`}>
+                <span className={`text-[10px] px-1 py-0.5 rounded truncate ${rd.color}`}>
                   {rd.label}
                 </span>
               </div>
             )
           })}
-          <div className="flex items-center gap-2 shrink-0 bg-slate-900/40 px-2 py-1 rounded">
+          <div className="flex items-center gap-1.5 min-w-0 flex-1 bg-slate-900/40 px-1.5 py-1 rounded">
             <span className="text-energy-text-secondary font-semibold">DXY</span>
             <span className="font-mono">{dxy?.close?.toFixed(1) || '—'}</span>
             {formatChange(dxy?.change_pct)}

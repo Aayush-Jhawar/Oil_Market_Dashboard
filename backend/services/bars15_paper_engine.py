@@ -30,6 +30,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
+from fractions import Fraction
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,81 @@ def _zscore_series(closes: List[float], window: int = WARMUP_BARS) -> List[Optio
     return z
 
 
+# Net leg coefficients of each structure in underlying contract-month space.
+# spread = c1 - c2 ; fly = c1 - 2*c2 + c3 ; double-fly = c1 - 3*c2 + 3*c3 - c4
+_STRUCT_COEFFS = {
+    "spread": [1, -1],
+    "fly": [1, -2, 1],
+    "double_fly": [1, -3, 3, -1],
+}
+
+
+def _exposure_vector(spec: Dict) -> Dict[Tuple[str, int], Fraction]:
+    """Net underlying contract-month exposure of a structure, keyed by
+    (product, relative_month). Two structures are redundant (one replicates the
+    other, e.g. a fly == long M1M2 spread + short M2M3 spread) iff their exposure
+    vectors are linearly dependent. Used to keep the open book independent."""
+    vec: Dict[Tuple[str, int], Fraction] = {}
+    if spec.get("symbol") == "WTI-Brent":
+        vec[("CL", 1)] = Fraction(1)
+        vec[("CO", 1)] = Fraction(-1)
+        return vec
+    coeffs = _STRUCT_COEFFS.get(spec.get("type", ""))
+    months = spec.get("months") or []
+    if not coeffs or len(coeffs) != len(months):
+        return vec
+    prod = spec["product"]
+    for m, c in zip(months, coeffs):
+        key = (prod, int(m))
+        vec[key] = vec.get(key, Fraction(0)) + Fraction(c)
+    return vec
+
+
+def _in_span(vec: Dict, basis: List[Dict]) -> bool:
+    """Exact test: is `vec` a linear combination of the vectors in `basis`?
+
+    Reduces the basis to echelon form (pivots keyed by the max contract leg
+    present) and then reduces `vec`; if it cancels to zero it lies in the span —
+    i.e. the structure is redundant given what is already open."""
+    if not any(v != 0 for v in vec.values()):
+        return True
+
+    def lead(d):
+        ks = [k for k, val in d.items() if val != 0]
+        return max(ks) if ks else None
+
+    pivots: Dict[Tuple[str, int], Dict] = {}
+    for row in basis:
+        rr = {k: Fraction(v) for k, v in row.items() if v != 0}
+        while True:
+            lk = lead(rr)
+            if lk is None:
+                break
+            if lk in pivots:
+                f = rr[lk] / pivots[lk][lk]
+                for k, val in pivots[lk].items():
+                    rr[k] = rr.get(k, Fraction(0)) - f * val
+                    if rr[k] == 0:
+                        del rr[k]
+            else:
+                pivots[lk] = rr
+                break
+
+    tt = {k: Fraction(v) for k, v in vec.items() if v != 0}
+    while True:
+        lk = lead(tt)
+        if lk is None:
+            return True
+        if lk in pivots:
+            f = tt[lk] / pivots[lk][lk]
+            for k, val in pivots[lk].items():
+                tt[k] = tt.get(k, Fraction(0)) - f * val
+                if tt[k] == 0:
+                    del tt[k]
+        else:
+            return False
+
+
 def _parse_validated_instruments() -> List[Dict]:
     """Translate ZScoreStrategy.VALIDATED_INSTRUMENTS into build specs (CL/CO only)."""
     from services.zscore_strategy import ZScoreStrategy
@@ -100,6 +176,9 @@ def _parse_validated_instruments() -> List[Dict]:
         elif kind == "FLY" and len(months) == 3:
             specs.append({"symbol": sym, "base": base, "product": BASE_TO_PRODUCT[base],
                           "type": "fly", "months": months})
+        elif kind == "SPREAD" and len(months) == 2:
+            specs.append({"symbol": sym, "base": base, "product": BASE_TO_PRODUCT[base],
+                          "type": "spread", "months": months})
     return specs
 
 
@@ -127,6 +206,8 @@ def _build_instrument_bars(loader, data, spec) -> Optional[List[Tuple[str, float
             df = SpreadConstructor.build_double_fly(legs[0], legs[1], legs[2], legs[3], *leg_names)
         elif spec["type"] == "fly":
             df = SpreadConstructor.build_fly(legs[0], legs[1], legs[2], *leg_names)
+        elif spec["type"] == "spread":
+            df = SpreadConstructor.build_spread(legs[0], legs[1], leg_names[0], leg_names[1])
         else:
             return None
 
@@ -169,8 +250,78 @@ def _ts_to_epoch(ts: str) -> float:
         return time.time()
 
 
+def _minutes_between(ts_a: str, ts_b: str) -> int:
+    try:
+        a = datetime.strptime(ts_a[:19], "%Y-%m-%d %H:%M:%S")
+        b = datetime.strptime(ts_b[:19], "%Y-%m-%d %H:%M:%S")
+        return int(abs((b - a).total_seconds()) / 60)
+    except Exception:
+        return 0
+
+
+def _structure_fields(sym: str, inst_type: str) -> Tuple[str, str, str]:
+    """Mirror the inline close-record naming so roll-closes are consistent."""
+    parts = sym.split("_")
+    structure = "SPREAD" if inst_type in ("fly", "spread") else "FLY" if inst_type == "double_fly" else inst_type.upper()
+    spread_name = "-"
+    fly_name = "-"
+    if "DFLY" in sym:
+        structure = "FLY"
+        if len(parts) >= 3:
+            fly_name = parts[-1]
+    elif "FLY" in sym:
+        structure = "FLY"
+        if len(parts) >= 3:
+            fly_name = parts[-1]
+    elif len(parts) >= 3:
+        structure = "SPREAD"
+        spread_name = parts[-1]
+    elif len(parts) == 2:
+        structure = "SPREAD"
+        spread_name = parts[1]
+    return structure, spread_name, fly_name
+
+
+# ── Frozen engine state (live-market, append-only) ───────────────────────────
+# Persists the book's runtime so executed trades are immutable across cycles.
+ENGINE_STATE_FILE = os.path.join(
+    os.path.dirname(__file__), "..", "data", "bars15_engine_state.json"
+)
+
+
+def _load_engine_state() -> Dict:
+    import json
+    try:
+        if os.path.exists(ENGINE_STATE_FILE):
+            with open(ENGINE_STATE_FILE, "r") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.warning(f"bars15: failed to load engine state: {e}")
+    return {}
+
+
+def _save_engine_state(state: Dict) -> None:
+    import json
+    try:
+        os.makedirs(os.path.dirname(ENGINE_STATE_FILE), exist_ok=True)
+        with open(ENGINE_STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        logger.warning(f"bars15: failed to save engine state: {e}")
+
+
 def run_replay(db_dir: str, starting_equity: float = 0.0) -> Optional[Dict]:
-    """Replay the 15-min DB through the Z-Score rules and return a tick-based state.
+    """Drive the paper book from the 15-min DB as a LIVE, append-only market.
+
+    The DB is treated as a live feed, not a backtest log: candles at or before the
+    persisted high-water mark (`last_processed_ts`) have already executed and are
+    frozen — they are never re-evaluated. Each cycle only makes new entry/exit
+    decisions on candles newer than that mark, and cumulative ticks / peak /
+    max-drawdown carry forward monotonically (drawdown can only deepen, never
+    recover via recomputation). Indicators still look back over full history, but
+    nothing in the past is re-traded. The first run (no saved state) boots the
+    market at the earliest candle and replays forward once until it catches up to
+    the present, then runs incrementally from then on.
 
     `starting_equity` is accepted for call-site compatibility but unused — the
     engine accounts purely in ticks.
@@ -185,6 +336,27 @@ def run_replay(db_dir: str, starting_equity: float = 0.0) -> Optional[Dict]:
     if not data:
         logger.warning(f"bars15: no contract tables found in {db_dir}")
         return None
+
+    # ── Roll off expired / stale contracts ───────────────────────────────────
+    # A futures contract that has stopped updating (expired / past last-trade)
+    # must NOT be treated as a live leg. Otherwise an expired front month — e.g.
+    # CL_N26 after its ~20th-of-month expiry — stays "M1" forever: it freezes any
+    # spread built on it (the WTI-Brent front spread goes stale) and shifts every
+    # relative-month index by one versus the other product. Keep only contracts
+    # whose last bar is within one day of the newest bar anywhere in the feed.
+    try:
+        global_max = max(df.index[-1] for df in data.values()
+                         if df is not None and not df.empty)
+        grace = pd.Timedelta(days=1)
+        live = {k: v for k, v in data.items()
+                if v is not None and not v.empty and v.index[-1] >= global_max - grace}
+        dropped = sorted(set(data) - set(live))
+        if dropped:
+            logger.info(f"bars15: rolled off {len(dropped)} expired/stale contract(s): {dropped}")
+        if live:
+            data = live
+    except Exception as e:
+        logger.warning(f"bars15: stale-contract roll filter failed: {e}")
 
     # Fetch Macro Data
     logger.info("bars15: fetching macro data...")
@@ -233,19 +405,119 @@ def run_replay(db_dir: str, starting_equity: float = 0.0) -> Optional[Dict]:
             events.append((s["bars"][i][0], si, i))
     events.sort(key=lambda e: (e[0], e[1]))
 
+    # ── Restore frozen engine state (live-market, append-only) ───────────────
+    saved = _load_engine_state()
+    sym_to_si = {s["spec"]["symbol"]: si for si, s in enumerate(streams)}
+
+    # Per-instrument high-water mark: each instrument trades on its own clock, so
+    # freezing the past is keyed per symbol. A laggy instrument whose new bar
+    # carries a timestamp older than another instrument's clock must still be
+    # processed — a single global mark would skip it forever.
+    saved_hwm: Dict[str, str] = dict(saved.get("hwm") or {})
+    _legacy_mark = saved.get("last_processed_ts")   # back-compat with old scalar state
+    hwm_si: Dict[int, Optional[str]] = {}
+    for si, s in enumerate(streams):
+        hwm_si[si] = saved_hwm.get(s["spec"]["symbol"], _legacy_mark)
+    new_hwm_si: Dict[int, Optional[str]] = dict(hwm_si)
+
+    cum_ticks = float(saved.get("cum_ticks", 0.0))
+    peak = float(saved.get("peak", 0.0))
+    max_dd = float(saved.get("max_dd", 0.0))
+    persisted_closed: List[Dict] = list(saved.get("closed_trades", []))
+    pnl_curve: List[float] = list(saved.get("pnl_curve", [0.0])) or [0.0]
+    traded_syms: set = set(saved.get("traded", []))   # symbols ever traded (frozen)
+
     positions: Dict[int, Dict] = {}
     cooldown: Dict[int, int] = {}
-    open_count = 0
-    closed_trades: List[Dict] = []
-    cum_ticks = 0.0
-    pnl_curve = [0.0]
-    peak = 0.0
-    max_dd = 0.0
+    closed_trades: List[Dict] = []   # trades that CLOSE this cycle (incl. rolls)
+
+    def _roll_close(sym: str, pos: Dict, why: str) -> None:
+        """Force-close a position whose instrument has rolled/expired.
+
+        When the front contract a position was built on expires (its bar series
+        is gone or the entry bar no longer exists), the position cannot be marked
+        on a live instrument any longer. A real desk would roll or close it rather
+        than carry a phantom open trade, so we realize it at the last price we
+        marked it at, charging the normal exit slippage. The realized P&L folds
+        into the frozen ledger and the monotonic drawdown like any other close.
+        """
+        nonlocal cum_ticks, peak, max_dd
+        mark = pos.get("last_mark")
+        if mark is None:
+            logger.warning(f"bars15: cannot roll-close {sym} ({why}) — no last mark, dropping")
+            return
+        inst_type = pos.get("instrument_type", "spread")
+        entry_price = float(pos["entry_price"])
+        gross = (float(mark) - entry_price) / TICK_SIZE
+        if pos["direction"] == "SHORT":
+            gross = -gross
+        slip = SLIPPAGE_TICKS.get(inst_type, 2.0)
+        pnl_ticks = round(gross - slip, 1)
+        cum_ticks = round(cum_ticks + pnl_ticks, 1)
+        pnl_curve.append(cum_ticks)
+        peak = max(peak, cum_ticks)
+        max_dd = max(max_dd, peak - cum_ticks)
+        structure, spread_name, fly_name = _structure_fields(sym, inst_type)
+        exit_ts = pos.get("last_mark_ts", pos.get("entry_ts", ""))
+        closed_trades.append({
+            "entry_time": pos["entry_ts"][5:16] if len(pos.get("entry_ts", "")) >= 16 else pos.get("entry_ts", ""),
+            "exit_time": exit_ts[5:16] if len(exit_ts) >= 16 else exit_ts,
+            "direction": pos["direction"],
+            "symbol": sym,
+            "structure": structure,
+            "spread": spread_name,
+            "fly": fly_name,
+            "entry": round(entry_price, 4),
+            "exit": round(float(mark), 4),
+            "target": pos.get("target_price", 0.0),
+            "stop": pos.get("stop_price", 0.0),
+            "pnl_dollars": pnl_ticks * 10.0,
+            "exit_reason": "ROLL",
+            "indicator": "ZSCORE",
+            "hold_min": _minutes_between(pos.get("entry_ts", ""), exit_ts),
+            "pnl": pnl_ticks,
+            "duration_h": round(_minutes_between(pos.get("entry_ts", ""), exit_ts) / 60.0, 2),
+            "signal": f"Contract roll ({why})",
+            "regime": pos.get("regime", "Unknown"),
+            "entry_z": pos.get("entry_z", 0.0),
+            "exit_z": 0.0,
+            "instrument_type": inst_type,
+            "slippage_ticks": slip,
+        })
+        logger.info(f"bars15: roll-closed {sym} at {mark} ({why}), pnl={pnl_ticks} tk")
+
+    # Re-attach carried-open positions to this cycle's freshly-built bar arrays,
+    # rolling off any whose instrument has expired since the last cycle.
+    for sym, pos in (saved.get("positions") or {}).items():
+        si = sym_to_si.get(sym)
+        if si is None:
+            _roll_close(sym, pos, "instrument no longer live")
+            continue
+        bars = streams[si]["bars"]
+        entry_i = next((k for k in range(len(bars)) if bars[k][0] == pos.get("entry_ts")), None)
+        if entry_i is None:
+            _roll_close(sym, pos, "entry bar rolled off")
+            continue
+        p = dict(pos)
+        p["entry_i"] = entry_i
+        positions[si] = p
+    for sym, cd in (saved.get("cooldown") or {}).items():
+        si = sym_to_si.get(sym)
+        if si is not None:
+            cooldown[si] = int(cd)
+
+    open_count = len(positions)
     bars_processed = 0
-    last_bar_ts: Optional[str] = None
-    traded: set = set()
+    last_bar_ts: Optional[str] = events[-1][0] if events else None
+    traded: set = set()              # stream indices that opened a trade this cycle
 
     for ts, si, i in events:
+        # Freeze the past: candles at/before THIS instrument's high-water mark
+        # already executed and are immutable.
+        h = hwm_si.get(si)
+        if h is not None and ts <= h:
+            continue
+        new_hwm_si[si] = ts          # events are time-sorted -> ends as the max
         bars_processed += 1
         if last_bar_ts is None or ts > last_bar_ts:
             last_bar_ts = ts
@@ -265,8 +537,12 @@ def run_replay(db_dir: str, starting_equity: float = 0.0) -> Optional[Dict]:
             if abs(z_prev) > STOP_Z:
                 reason = "Stop Loss"
                 cooldown[si] = COOLDOWN_BARS
-            # elif bars_held >= TIMEOUT_BARS:
-            #     reason = "Timeout"
+            elif bars_held >= TIMEOUT_BARS:
+                # Time stop: a mean-reversion trade that has not reverted within
+                # TIMEOUT_BARS is exited at market. Without this, positions are
+                # held indefinitely until they revert, which manufactures an
+                # unrealistically high win rate by never realizing slow losers.
+                reason = "Timeout"
             elif (pos["direction"] == "LONG" and z_prev >= 0) or \
                  (pos["direction"] == "SHORT" and z_prev <= 0):
                 reason = "Mean Reversion Complete"
@@ -389,10 +665,38 @@ def run_replay(db_dir: str, starting_equity: float = 0.0) -> Optional[Dict]:
                                 continue
                 except Exception as e:
                     pass
-                
-                
+
+                # Redundancy guard: never open a structure that is a linear
+                # combination of positions already open. e.g. if the M1M2 and
+                # M2M3 spreads are open, the M1M2M3 fly is the same bet (fly =
+                # spread1 - spread2) and must not be traded again; likewise a
+                # double-fly vs its two constituent flies. Keeps the book's risk
+                # factors independent and prevents executing the same trade twice.
+                cand_vec = _exposure_vector(spec)
+                open_vecs = [_exposure_vector(streams[osi]["spec"]) for osi in positions]
+                if _in_span(cand_vec, open_vecs):
+                    logger.debug(
+                        f"bars15: skipped redundant entry {spec['symbol']} "
+                        f"(linearly dependent on open book)"
+                    )
+                    continue
+
                 # Z=0 is mean (target). Z=STOP_Z is stop.
                 target_price = mean_prev
+
+                # Profitability guard: the reversion target must clear the
+                # round-trip slippage. If the distance from the fill to the mean is
+                # not larger than the slippage charged on the trade, the position
+                # cannot make money even on a perfect reversion — so skip the signal.
+                entry_slip = SLIPPAGE_TICKS.get(spec["type"], 2.0)
+                target_ticks = abs(fill - target_price) / TICK_SIZE
+                if target_ticks <= entry_slip:
+                    logger.debug(
+                        f"bars15: skipped {spec['symbol']} — target {target_ticks:.1f} tk "
+                        f"<= slippage {entry_slip} tk"
+                    )
+                    continue
+
                 if direction == "LONG":
                     stop_price = mean_prev - (STOP_Z * std_prev)
                 else:
@@ -410,11 +714,9 @@ def run_replay(db_dir: str, starting_equity: float = 0.0) -> Optional[Dict]:
                 open_count += 1
                 traded.add(si)
 
-    if bars_processed == 0:
-        return None
-
     # ── Carry still-open positions (unrealized ticks vs last close) ──────────
     open_positions: List[Dict] = []
+    persist_positions: Dict[str, Dict] = {}
     for si, pos in positions.items():
         s = streams[si]
         spec = s["spec"]
@@ -435,10 +737,49 @@ def run_replay(db_dir: str, starting_equity: float = 0.0) -> Optional[Dict]:
             "base_sym": spec["base"],
             "is_manual": False,
         })
+        # Freeze the open position by symbol so it survives the next rebuild.
+        # `last_mark`/`last_mark_ts` let us fairly price a forced roll-close if the
+        # instrument expires before the position exits normally.
+        persist_positions[spec["symbol"]] = {
+            "entry_price": pos["entry_price"],
+            "direction": pos["direction"],
+            "entry_ts": pos["entry_ts"],
+            "entry_z": pos["entry_z"],
+            "target_price": pos.get("target_price", 0.0),
+            "stop_price": pos.get("stop_price", 0.0),
+            "instrument_type": spec["type"],
+            "regime": s["regime"].get("regime", "Unknown"),
+            "last_mark": round(last_close, 4),
+            "last_mark_ts": s["bars"][-1][0],
+        }
+
+    # Fold this cycle's new trades into the frozen ledger (append-only).
+    traded_syms |= {streams[si]["spec"]["symbol"] for si in traded}
+    all_closed = persisted_closed + closed_trades
+    persist_cooldown = {
+        streams[si]["spec"]["symbol"]: cd for si, cd in cooldown.items() if cd > 0
+    }
+    # Persist each instrument's own high-water mark.
+    persist_hwm = {
+        streams[si]["spec"]["symbol"]: h for si, h in new_hwm_si.items() if h is not None
+    }
+
+    _save_engine_state({
+        "hwm": persist_hwm,
+        "last_processed_ts": last_bar_ts,
+        "cum_ticks": round(cum_ticks, 1),
+        "peak": round(peak, 1),
+        "max_dd": round(max_dd, 1),
+        "closed_trades": all_closed[-1000:],
+        "pnl_curve": pnl_curve[-2000:],
+        "traded": sorted(traded_syms),
+        "positions": persist_positions,
+        "cooldown": persist_cooldown,
+    })
 
     unrealized = round(sum(p["pnl"] for p in open_positions), 1)
     return {
-        "closed_trades": closed_trades[-200:],
+        "closed_trades": all_closed[-200:],
         "open_positions": open_positions,
         "pnl_curve_ticks": pnl_curve[-1000:],
         "realized_pnl_ticks": round(cum_ticks, 1),
@@ -447,6 +788,6 @@ def run_replay(db_dir: str, starting_equity: float = 0.0) -> Optional[Dict]:
         "max_drawdown_ticks": round(max_dd, 1),
         "max_concurrent": MAX_CONCURRENT,
         "bars_processed": bars_processed,
-        "instruments_traded": len(traded),
+        "instruments_traded": len(traded_syms),
         "last_bar_ts": last_bar_ts,
     }

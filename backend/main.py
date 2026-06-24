@@ -284,8 +284,10 @@ async def _paper_trading_publisher():
     with a 20-bar rolling window. We replay the candles in `DB/bars_15min_latest.db`
     (the same data the backtest/journals used) through the audited strategy each
     cycle, so the paper book reflects exactly the trades the strategy takes on the
-    real candles that have been received. The replay is deterministic and idempotent;
-    new bars synced into the DB produce new trades on the next cycle.
+    real candles that have been received. The engine treats the DB as a LIVE,
+    append-only feed: executed trades are frozen and only candles newer than the
+    persisted high-water mark generate new trades on the next cycle. Drawdown is
+    monotonic and is never recomputed away.
     """
     loop = asyncio.get_event_loop()
     from services.bars15_paper_engine import run_replay
@@ -330,20 +332,58 @@ async def _start_background_publishers():
     _background_tasks.append(asyncio.create_task(_paper_trading_publisher()))
 
     def _run_db_sync_blocking():
-        import shutil
+        import sqlite3 as _sqlite3
         import os
-        source_base = r"I:\Public\Summer Interns Energy\DB\bars_15min_20260612"
-        # The DB folder is at ../DB relative to backend/main.py
-        dest_base = os.path.join(os.path.dirname(__file__), "..", "DB", "bars_15min_latest")
-        for ext in [".db", ".db-wal"]:
-            src = source_base + ext
-            dst = dest_base + ext
-            if os.path.exists(src):
-                try:
-                    shutil.copy2(src, dst)
-                    logger.info(f"Successfully copied {src} to {dst}")
-                except Exception as e:
-                    logger.error(f"Failed to copy {src}: {e}")
+        import glob as _glob
+        source_dir = r"I:\Public\Summer Interns Energy\DB"
+        # Merge ALL bars_15min_*.db snapshots so history accumulates locally
+        # even when each I-drive snapshot only contains a short recent window.
+        candidates = sorted(_glob.glob(os.path.join(source_dir, "bars_15min_????????.db")))
+        if not candidates:
+            logger.warning("DB sync: no bars_15min_*.db found on I drive, skipping")
+            return
+        dest_db = os.path.join(os.path.dirname(__file__), "..", "DB", "bars_15min_latest.db")
+        dest_conn = _sqlite3.connect(dest_db)
+        total_inserted = 0
+        for src_db in candidates:
+            try:
+                src_conn = _sqlite3.connect(src_db)
+                tables = [t[0] for t in src_conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()]
+                for tbl in tables:
+                    # Ensure destination table exists with the same schema
+                    ddl = src_conn.execute(
+                        f"SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (tbl,)
+                    ).fetchone()
+                    if ddl and ddl[0]:
+                        dest_conn.execute(ddl[0].replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
+                        dest_conn.execute(
+                            f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{tbl}_ts ON {tbl}(timestamp)"
+                        )
+                    rows = src_conn.execute(
+                        f"SELECT timestamp, open, high, low, close, volume FROM {tbl}"
+                    ).fetchall()
+                    inserted = 0
+                    for row in rows:
+                        try:
+                            dest_conn.execute(
+                                f"INSERT OR IGNORE INTO {tbl} (timestamp, open, high, low, close, volume) VALUES (?,?,?,?,?,?)",
+                                row,
+                            )
+                            inserted += dest_conn.execute("SELECT changes()").fetchone()[0]
+                        except Exception:
+                            pass
+                    total_inserted += inserted
+                src_conn.close()
+            except Exception as e:
+                logger.error(f"DB sync: failed merging {src_db}: {e}")
+        dest_conn.commit()
+        dest_conn.close()
+        if total_inserted:
+            logger.info(f"DB sync: merged {len(candidates)} snapshot(s), inserted {total_inserted} new rows into bars_15min_latest.db")
+        else:
+            logger.info(f"DB sync: no new rows from {len(candidates)} snapshot(s)")
 
     async def _trigger_db_sync():
         loop = asyncio.get_running_loop()

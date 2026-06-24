@@ -64,5 +64,12 @@ auto_publish.py
 # Research journals (private)
 research_journals/
 
+# EIA inventory analysis — ignore generated reports/deliverables & scratch
+# dumps, but keep the .py sources tracked.
+eia_inventory_analysis/output/
+eia_inventory_analysis/report/
+eia_inventory_analysis_v2/output/
+eia_inventory_analysis_v2/_*
+
 # TypeScript build info
 *.tsbuildinfo

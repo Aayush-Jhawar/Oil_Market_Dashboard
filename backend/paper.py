@@ -470,12 +470,13 @@ class PaperTradingBook:
             self.closed_trades = self.closed_trades[-200:]
 
     def apply_replay(self, state: Dict[str, Any]):
-        """Ingest a deterministic replay produced from the 15-min candle DB.
+        """Mirror the live, append-only 15-min engine into the UI book.
 
-        The 15-min engine rebuilds the full strategy ledger each cycle, so this
-        overwrites the strategy-driven book with the replay result and persists it.
-        Manual positions (is_manual) opened via the API are preserved and carried
-        forward so a manual trade is not wiped by the next replay cycle.
+        The engine is now authoritative and frozen: it accumulates executed trades
+        and a monotonic drawdown in its own state file and returns the current
+        ledger. This reflects that ledger into the strategy-driven book and
+        persists it. Manual positions (is_manual) opened via the API are preserved
+        and carried forward so a manual trade is not wiped by the next cycle.
         """
         manual_positions = [p for p in self.open_positions if p.get("is_manual")]
 

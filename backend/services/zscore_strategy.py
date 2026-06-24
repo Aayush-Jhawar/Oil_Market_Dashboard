@@ -21,6 +21,14 @@ class ZScoreStrategy:
         "WTI_DFLY_7_8_9_10": True, "WTI_DFLY_4_5_6_7": True, 
         "WTI_DFLY_3_4_5_6": True,
         
+        # Priority 3: Flies (single butterflies)
+        "BRENT_FLY_1_2_3": True, "BRENT_FLY_2_3_4": True, "BRENT_FLY_3_4_5": True,
+        "WTI_FLY_1_2_3": True, "WTI_FLY_2_3_4": True, "WTI_FLY_3_4_5": True,
+
+        # Priority 4: Calendar Spreads
+        "BRENT_SPREAD_1_2": True, "BRENT_SPREAD_2_3": True, "BRENT_SPREAD_3_4": True,
+        "WTI_SPREAD_1_2": True, "WTI_SPREAD_2_3": True, "WTI_SPREAD_3_4": True,
+
         # Priority 5: Cross-Exchange Spreads
         "WTI-BRENT": True
     }

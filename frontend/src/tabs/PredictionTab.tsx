@@ -585,6 +585,27 @@ export function PredictionTab() {
         const avgHoldTime = trades.length > 0 ? trades.reduce((acc: number, t: any) => acc + (t.duration_h || 0), 0) / trades.length : 0;
         const totalSlippage = trades.reduce((acc: number, t: any) => acc + (t.slippage_ticks || t.slippage || 0), 0);
 
+        // Trade counts broken down by product (WTI / BRN) and structure
+        // (Fly / DFly / intra-product Spread), plus the WTI-BRN cross spread.
+        const classify = (t: any): { product: 'WTI' | 'BRN' | 'XBR' | null; structure: 'fly' | 'dfly' | 'spread' } => {
+          const sym = (t.symbol || '').toUpperCase();
+          const type = (t.instrument_type || '').toLowerCase();
+          if (sym === 'WTI-BRENT' || sym === 'WTI-BRN') return { product: 'XBR', structure: 'spread' };
+          const product = sym.startsWith('WTI') ? 'WTI' : (sym.startsWith('BRENT') || sym.startsWith('BRN')) ? 'BRN' : null;
+          const structure = type === 'double_fly' ? 'dfly' : type === 'fly' ? 'fly' : type === 'spread' ? 'spread'
+            : sym.includes('DFLY') ? 'dfly' : sym.includes('FLY') ? 'fly' : 'spread';
+          return { product, structure };
+        };
+        const tally = { WTI: { fly: 0, dfly: 0, spread: 0 }, BRN: { fly: 0, dfly: 0, spread: 0 }, XBR: 0 };
+        trades.forEach((t: any) => {
+          const { product, structure } = classify(t);
+          if (product === 'XBR') tally.XBR += 1;
+          else if (product) tally[product][structure] += 1;
+        });
+        const rowTotal = (p: 'WTI' | 'BRN') => tally[p].fly + tally[p].dfly + tally[p].spread;
+        const colTotal = (s: 'fly' | 'dfly' | 'spread') => tally.WTI[s] + tally.BRN[s];
+        const grandStructured = rowTotal('WTI') + rowTotal('BRN');
+
         return (
           <div className="mt-8 p-5 rounded-xl border bg-slate-800/50 border-slate-700/50">
             <div className="flex items-center justify-between mb-4">
@@ -627,6 +648,51 @@ export function PredictionTab() {
               <div className="bg-slate-700/30 p-3 rounded-lg border border-slate-700/50">
                 <div className="text-xs text-slate-400 mb-1">Est. Slippage Paid</div>
                 <div className="text-lg font-bold text-orange-400">-{totalSlippage.toFixed(1)} tk</div>
+              </div>
+            </div>
+
+            {/* Trades by structure (Fly / DFly / Spread) per product + cross spread */}
+            <div className="mt-5">
+              <div className="text-sm font-semibold text-slate-300 mb-2">Total Trades by Structure</div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-sm">
+                  <thead>
+                    <tr className="border-b border-slate-700/50 text-slate-400">
+                      <th className="pb-2 px-2 font-medium">Product</th>
+                      <th className="pb-2 px-2 font-medium text-right">Fly</th>
+                      <th className="pb-2 px-2 font-medium text-right">DFly</th>
+                      <th className="pb-2 px-2 font-medium text-right">Spread</th>
+                      <th className="pb-2 px-2 font-medium text-right">Total</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr className="border-b border-slate-700/30">
+                      <td className="py-2 px-2 text-slate-200">WTI</td>
+                      <td className="py-2 px-2 font-mono text-right text-slate-300">{tally.WTI.fly}</td>
+                      <td className="py-2 px-2 font-mono text-right text-slate-300">{tally.WTI.dfly}</td>
+                      <td className="py-2 px-2 font-mono text-right text-slate-300">{tally.WTI.spread}</td>
+                      <td className="py-2 px-2 font-mono text-right text-slate-100 font-semibold">{rowTotal('WTI')}</td>
+                    </tr>
+                    <tr className="border-b border-slate-700/30">
+                      <td className="py-2 px-2 text-slate-200">BRN</td>
+                      <td className="py-2 px-2 font-mono text-right text-slate-300">{tally.BRN.fly}</td>
+                      <td className="py-2 px-2 font-mono text-right text-slate-300">{tally.BRN.dfly}</td>
+                      <td className="py-2 px-2 font-mono text-right text-slate-300">{tally.BRN.spread}</td>
+                      <td className="py-2 px-2 font-mono text-right text-slate-100 font-semibold">{rowTotal('BRN')}</td>
+                    </tr>
+                    <tr>
+                      <td className="py-2 px-2 text-slate-200 font-semibold">Both</td>
+                      <td className="py-2 px-2 font-mono text-right text-slate-100 font-semibold">{colTotal('fly')}</td>
+                      <td className="py-2 px-2 font-mono text-right text-slate-100 font-semibold">{colTotal('dfly')}</td>
+                      <td className="py-2 px-2 font-mono text-right text-slate-100 font-semibold">{colTotal('spread')}</td>
+                      <td className="py-2 px-2 font-mono text-right text-slate-100 font-semibold">{grandStructured}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <div className="mt-3 flex items-center justify-between bg-slate-700/30 p-3 rounded-lg border border-slate-700/50">
+                <span className="text-xs text-slate-400">WTI-BRN Cross Spread</span>
+                <span className="text-lg font-bold text-slate-200">{tally.XBR}</span>
               </div>
             </div>
           </div>
@@ -710,16 +776,12 @@ export function PredictionTab() {
                   <th className="pb-3 px-2 font-medium">Exit Time</th>
                   <th className="pb-3 px-2 font-medium">Dir</th>
                   <th className="pb-3 px-2 font-medium">Instrument</th>
-                  <th className="pb-3 px-2 font-medium">Structure</th>
-                  <th className="pb-3 px-2 font-medium">Spread</th>
-                  <th className="pb-3 px-2 font-medium">Fly</th>
                   <th className="pb-3 px-2 font-medium text-right">Entry</th>
                   <th className="pb-3 px-2 font-medium text-right">Exit</th>
                   <th className="pb-3 px-2 font-medium text-right">Target</th>
                   <th className="pb-3 px-2 font-medium text-right">Stop</th>
                   <th className="pb-3 px-2 font-medium text-right">P&amp;L (ticks) ▼</th>
                   <th className="pb-3 px-2 font-medium text-center">Exit Reason</th>
-                  <th className="pb-3 px-2 font-medium text-center">Indicator</th>
                   <th className="pb-3 px-2 font-medium text-right">Hold (min)</th>
                 </tr>
               </thead>
@@ -730,9 +792,6 @@ export function PredictionTab() {
                     <td className="py-3 px-2 text-slate-400">{t.exit_time}</td>
                     <td className={`py-3 px-2 font-semibold ${t.direction === 'LONG' ? 'text-green-500' : 'text-red-500'}`}>{t.direction}</td>
                     <td className="py-3 px-2 font-mono text-slate-200">{t.symbol}</td>
-                    <td className="py-3 px-2 text-slate-400">{t.structure}</td>
-                    <td className="py-3 px-2 text-slate-400">{t.spread}</td>
-                    <td className="py-3 px-2 text-slate-400">{t.fly}</td>
                     <td className="py-3 px-2 font-mono text-slate-300 text-right">{(t.entry ?? 0).toFixed(4)}</td>
                     <td className="py-3 px-2 font-mono text-slate-300 text-right">{(t.exit ?? 0).toFixed(4)}</td>
                     <td className="py-3 px-2 font-mono text-slate-400 text-right">{(t.target ?? 0).toFixed(4)}</td>
@@ -741,7 +800,6 @@ export function PredictionTab() {
                       {t.pnl >= 0 ? '+' : ''}{(t.pnl ?? 0).toFixed(0)} tk
                     </td>
                     <td className="py-3 px-2 text-slate-400 text-center text-xs">{t.exit_reason}</td>
-                    <td className="py-3 px-2 text-slate-400 text-center text-xs">{t.indicator}</td>
                     <td className="py-3 px-2 text-slate-400 text-right">{t.hold_min}</td>
                   </tr>
                 ))}
