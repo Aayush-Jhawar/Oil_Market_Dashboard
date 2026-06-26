@@ -33,7 +33,7 @@ export default function PaperTrading() {
 
   const fetchPaper = async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/paper/state`);
+      const res = await fetch(`${API_BASE}/api/paper/state?recent=10`);
       if (!res.ok) throw new Error('non-200');
       const json = await res.json();
       if (json?.data) setLiveData(json.data as PaperState);

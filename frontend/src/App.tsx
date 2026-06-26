@@ -20,10 +20,12 @@ const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 const api = axios.create({ baseURL: API_BASE, timeout: 90000 })
 
 function App() {
-  const { activeTab, setActiveTab } = useDashboardStore((state) => ({
-    activeTab: state.activeTab,
-    setActiveTab: state.setActiveTab,
-  }))
+  // Single-value selectors: only re-render when activeTab actually changes.
+  // Object selectors without `shallow` always return a new reference → App would
+  // re-render on every store update (WebSocket prices every 5s, historical fetches,
+  // snapshotMapper updates) → OverviewTab re-renders constantly → clicks swallowed.
+  const activeTab = useDashboardStore((state) => state.activeTab)
+  const setActiveTab = useDashboardStore((state) => state.setActiveTab)
   const [showSettings, setShowSettings] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
 
@@ -34,30 +36,18 @@ function App() {
     })
   }, [])
 
-  const {
-    setPrices,
-    setHistoricalPrices,
-    setSignals,
-    setCracks,
-    setNews,
-    setMacro,
-    setRigs,
-    setCFTC,
-    setEIAData,
-    setEIAStatus,
-    setCFTCStatus,
-    setForwardCurve,
-    setAnalytics,
-    setEnhancedSignals,
-    setIndicators,
-  } = useDashboardStore()
-
   useEffect(() => {
     const fetchDashboard = async () => {
+      // Read store actions once via getState() — they're stable and never change,
+      // so we don't need to subscribe (which would cause App to re-render on
+      // every store update and swallow clicks).
+      const store = useDashboardStore.getState()
+
       try {
-        const endpoints = await Promise.allSettled([
+        // Fast endpoints only — composite is slow (8s cold) and fetched separately
+        // below so it never blocks the isLoading gate.
+        const [pricesRes, enhancedRes, macroRes, eiaRes, cftcRes, rigsRes, forwardRes, analyticsRes, newsRes, indicatorsRes] = await Promise.allSettled([
           api.get(`/api/prices/all`),
-          api.get(`/api/signals/composite`),
           api.get(`/api/signals/enhanced`),
           api.get(`/api/macro/all`),
           api.get(`/api/eia/weekly`),
@@ -69,19 +59,13 @@ function App() {
           api.get(`/api/analytics/indicators?symbol=WTI&period=3mo&ema_periods=20,50&atr_period=14`),
         ])
 
-        const [pricesRes, compositeRes, enhancedRes, macroRes, eiaRes, cftcRes, rigsRes, forwardRes, analyticsRes, newsRes, indicatorsRes] = endpoints
-
         if (pricesRes.status === 'fulfilled' && pricesRes.value.data?.data) {
-          setPrices(pricesRes.value.data.data)
-        }
-
-        if (compositeRes.status === 'fulfilled' && compositeRes.value.data?.data) {
-          setSignals(compositeRes.value.data.data)
+          store.setPrices(pricesRes.value.data.data)
         }
 
         if (enhancedRes.status === 'fulfilled' && enhancedRes.value.data?.data) {
-          setEnhancedSignals(enhancedRes.value.data.data)
-          setCracks({
+          store.setEnhancedSignals(enhancedRes.value.data.data)
+          store.setCracks({
             crack_321: enhancedRes.value.data.data.market_state.crack_321,
             crack_532: enhancedRes.value.data.data.market_state.crack_532,
             cl_brent_spread: enhancedRes.value.data.data.market_state.cl_brent_spread,
@@ -90,82 +74,72 @@ function App() {
         }
 
         if (macroRes.status === 'fulfilled' && macroRes.value.data?.data) {
-          setMacro(macroRes.value.data.data)
+          store.setMacro(macroRes.value.data.data)
         }
 
         if (eiaRes.status === 'fulfilled' && eiaRes.value.data?.data && Object.keys(eiaRes.value.data.data).length > 0) {
-          setEIAData(eiaRes.value.data.data)
-          setEIAStatus('ready')
+          store.setEIAData(eiaRes.value.data.data)
+          store.setEIAStatus('ready')
         } else {
-          // Request resolved with no usable payload, or the call itself rejected.
-          setEIAStatus('unavailable')
+          store.setEIAStatus('unavailable')
         }
 
         if (cftcRes.status === 'fulfilled' && cftcRes.value.data?.data && cftcRes.value.data.data.WTI) {
-          setCFTC(cftcRes.value.data.data)
-          setCFTCStatus('ready')
+          store.setCFTC(cftcRes.value.data.data)
+          store.setCFTCStatus('ready')
         } else {
-          setCFTCStatus('unavailable')
+          store.setCFTCStatus('unavailable')
         }
 
         if (rigsRes.status === 'fulfilled' && rigsRes.value.data?.data) {
-          setRigs(rigsRes.value.data.data)
+          store.setRigs(rigsRes.value.data.data)
         }
 
         if (forwardRes.status === 'fulfilled' && forwardRes.value.data?.data?.forward_curve) {
-          setForwardCurve(forwardRes.value.data.data.forward_curve)
+          store.setForwardCurve(forwardRes.value.data.data.forward_curve)
         }
 
         if (analyticsRes.status === 'fulfilled' && analyticsRes.value.data?.data) {
-          setAnalytics(analyticsRes.value.data.data)
+          store.setAnalytics(analyticsRes.value.data.data)
         }
 
         if (newsRes.status === 'fulfilled' && newsRes.value.data?.data) {
-          setNews(newsRes.value.data.data)
+          store.setNews(newsRes.value.data.data)
         }
 
         if (indicatorsRes.status === 'fulfilled' && indicatorsRes.value.data?.data) {
-          setIndicators(indicatorsRes.value.data.data)
+          store.setIndicators(indicatorsRes.value.data.data)
         }
-
-        const historySymbols = ['WTI', 'Brent', 'RBOB', 'HO', 'GO', 'NG', '3-2-1CRACK', 'GASCRACK', 'DIESELCRACK', 'WTI-Brent', 'WTI_CAL_SPREAD', 'BRENT_CAL_SPREAD', 'WTI_FLY', 'BRENT_FLY', 'HO_FLY']
-        await Promise.allSettled(
-          historySymbols.map(async (symbol) => {
-            try {
-              const response = await api.get(`/api/prices/${symbol}/historical?period=1mo`)
-              if (response.data?.data) {
-                setHistoricalPrices(symbol, response.data.data)
-              }
-            } catch (error) {
-              console.warn(`Failed historical data for ${symbol}:`, error)
-            }
-          }),
-        )
       } catch (error) {
         console.warn('Dashboard load failed:', error)
       } finally {
+        // Page is interactive now — composite and historical load in background.
         setIsLoading(false)
       }
+
+      // Background: fetch composite (slow on cold start, instant when cached).
+      api.get(`/api/signals/composite`).then((res) => {
+        if (res.data?.data) useDashboardStore.getState().setSignals(res.data.data)
+      }).catch(() => {})
+
+      // Background: fetch per-symbol historical prices.
+      const historySymbols = ['WTI', 'Brent', 'RBOB', 'HO', 'GO', 'NG', '3-2-1CRACK', 'GASCRACK', 'DIESELCRACK', 'WTI-Brent', 'WTI_CAL_SPREAD', 'BRENT_CAL_SPREAD', 'WTI_FLY', 'BRENT_FLY', 'HO_FLY']
+      Promise.allSettled(
+        historySymbols.map(async (symbol) => {
+          try {
+            const response = await api.get(`/api/prices/${symbol}/historical?period=1mo`)
+            if (response.data?.data) {
+              useDashboardStore.getState().setHistoricalPrices(symbol, response.data.data)
+            }
+          } catch (error) {
+            console.warn(`Failed historical data for ${symbol}:`, error)
+          }
+        }),
+      )
     }
 
     fetchDashboard()
-  }, [
-    setPrices,
-    setHistoricalPrices,
-    setSignals,
-    setCracks,
-    setNews,
-    setMacro,
-    setRigs,
-    setCFTC,
-    setEIAData,
-    setEIAStatus,
-    setCFTCStatus,
-    setForwardCurve,
-    setAnalytics,
-    setEnhancedSignals,
-    setIndicators,
-  ])
+  }, [])
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-50 pt-14">

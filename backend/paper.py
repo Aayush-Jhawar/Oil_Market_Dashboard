@@ -465,9 +465,6 @@ class PaperTradingBook:
             "instrument_type": inst_type,
             "slippage_ticks": slippage,
         })
-        
-        if len(self.closed_trades) > 200:
-            self.closed_trades = self.closed_trades[-200:]
 
     def apply_replay(self, state: Dict[str, Any]):
         """Mirror the live, append-only 15-min engine into the UI book.
@@ -506,7 +503,9 @@ class PaperTradingBook:
     def get_state(self) -> Dict[str, Any]:
         # Everything is in TICKS. No sharpe, no equity, no return-% (no capital cap).
         closed = self.closed_trades
-        realized_ticks = round(sum(t.get("pnl", 0.0) for t in closed), 1)
+        # Use the stored cumulative realized P&L from the engine — this is the
+        # authoritative all-time value, not re-summed from closed_trades.
+        realized_ticks = round(getattr(self, "realized_pnl_ticks", 0.0), 1)
         unrealized_ticks = round(sum(p.get("pnl", 0.0) for p in self.open_positions), 1)
 
         valid_trades = [t for t in closed if t.get("pnl", 0.0) != 0]

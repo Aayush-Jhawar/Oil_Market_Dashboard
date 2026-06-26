@@ -193,7 +193,7 @@ class EIAFetcher:
                 "length": 260,  # 5 years of weekly data
             }
 
-            response = requests.get(url, params=params, timeout=(2.5, 4.0))
+            response = requests.get(url, params=params, timeout=(5, 30))
             response.raise_for_status()
             data = response.json()
 

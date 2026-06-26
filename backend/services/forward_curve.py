@@ -186,7 +186,7 @@ def _curve_from_candle_db(symbol: str) -> List[Dict]:
         import sqlite3
         import os
         base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        db_path = os.path.join(base_dir, "DB", "bars_15min_latest.db")
+        db_path = os.environ.get("BARS15_DB_PATH") or os.path.join(base_dir, "DB", "bars_15min_latest.db")
         prefix = "CL" if symbol == "WTI" else ("CO" if symbol in ("Brent", "BRN") else None)
         if not prefix or not os.path.exists(db_path):
             return []
@@ -200,14 +200,47 @@ def _curve_from_candle_db(symbol: str) -> List[Dict]:
             except Exception:
                 return (99, 99)
 
-        conn = sqlite3.connect(db_path)
+        # Bounded busy_timeout so the price/curve hot path degrades to [] rather
+        # than blocking if a writer (db-sync merge) momentarily holds the lock.
+        conn = sqlite3.connect(db_path, timeout=3)
+        conn.execute("PRAGMA busy_timeout=3000")
         tabs = sorted(
             (t[0] for t in conn.execute(
                 f"SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '{prefix}_%'").fetchall()),
             key=_key,
         )
+        
+        # Find global max timestamp to determine active M1
+        table_max_ts = {}
+        global_max = ""
+        for t in tabs:
+            row = conn.execute(f"SELECT MAX(timestamp) FROM {t}").fetchone()
+            if row and row[0]:
+                ts = row[0]
+                table_max_ts[t] = ts
+                if ts > global_max:
+                    global_max = ts
+                    
+        active_index = 0
+        if global_max:
+            from datetime import datetime, timedelta
+            try:
+                clean_max = global_max.replace("T", " ")[:19]
+                max_dt = datetime.strptime(clean_max, "%Y-%m-%d %H:%M:%S")
+                cutoff_str = (max_dt - timedelta(days=4)).strftime("%Y-%m-%d %H:%M:%S")
+            except:
+                cutoff_str = global_max
+
+            for i, t in enumerate(tabs):
+                ts = table_max_ts.get(t, "")
+                clean_ts = ts.replace("T", " ")[:19]
+                if clean_ts >= cutoff_str:
+                    active_index = i
+                    break
+                    
         points = []
-        for i, t in enumerate(tabs[:14]):
+        active_tabs = tabs[active_index:active_index + 14]
+        for i, t in enumerate(active_tabs):
             row = conn.execute(f"SELECT close FROM {t} ORDER BY timestamp DESC LIMIT 1").fetchone()
             if row and row[0]:
                 points.append({"month": f"M{i + 1}", "label": t.split('_')[1],

@@ -1,3 +1,4 @@
+# Paper trading state repaired — all trade caps removed
 import os
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '.env'), override=True)
@@ -272,6 +273,15 @@ async def _warmup_cache():
                         pass
 
         await loop.run_in_executor(None, warmup_spreads)
+
+        # Pre-warm the composite signal cache so the first browser load hits
+        # the cache (~0.02s) instead of computing cold (~8s).
+        try:
+            await loop.run_in_executor(None, get_composite_signal)
+            logger.info("Composite signal cache pre-warmed.")
+        except Exception as ce:
+            logger.warning(f"Composite cache pre-warm failed: {ce}")
+
         logger.info("Cache warm-up complete.")
     except Exception as e:
         logger.error(f"Cache warm-up failed: {e}")
@@ -292,7 +302,8 @@ async def _paper_trading_publisher():
     loop = asyncio.get_event_loop()
     from services.bars15_paper_engine import run_replay
 
-    db_dir = os.path.join(os.path.dirname(__file__), "..", "DB")
+    # Local, non-synced DB dir (see config.BARS15_DB_DIR) — never the OneDrive DB/.
+    db_dir = os.environ.get("BARS15_DB_DIR") or os.path.join(os.path.dirname(__file__), "..", "DB")
     starting_equity = paper_book.starting_equity
 
     while True:
@@ -326,10 +337,22 @@ async def _start_background_publishers():
     except Exception as e:
         logger.error(f"Error populating database with /Data: {e}")
 
+    # Seed the spread calculator's daily history so /api/spreads/all returns real
+    # 5d/30d means, std and z-scores instead of mean==value / 0.00σ for every
+    # spread. _warmup_cache does its blocking yfinance/DB fetches inside a thread
+    # executor, so running it as a background task does not block startup; the
+    # KEY SPREADS panel fills in its deltas a few seconds after boot.
+    _background_tasks.append(asyncio.create_task(_warmup_cache()))
+
     # start background publishers
     _background_tasks.append(asyncio.create_task(_price_publisher()))
     _background_tasks.append(asyncio.create_task(_signals_publisher()))
     _background_tasks.append(asyncio.create_task(_paper_trading_publisher()))
+
+    # mtime cache: skip I-drive snapshots that haven't changed since last merge.
+    # Keyed by full source path → float mtime. Lives in the closure so it
+    # persists across sync runs for the lifetime of the process.
+    _synced_mtimes: dict = {}
 
     def _run_db_sync_blocking():
         import sqlite3 as _sqlite3
@@ -342,56 +365,180 @@ async def _start_background_publishers():
         if not candidates:
             logger.warning("DB sync: no bars_15min_*.db found on I drive, skipping")
             return
-        dest_db = os.path.join(os.path.dirname(__file__), "..", "DB", "bars_15min_latest.db")
-        dest_conn = _sqlite3.connect(dest_db)
+        dest_db = os.environ.get("BARS15_DB_PATH") or os.path.join(os.path.dirname(__file__), "..", "DB", "bars_15min_latest.db")
+        # WAL + a bounded busy_timeout so this merge never blocks the price/curve
+        # readers of bars_15min_latest.db (forward_curve / bars15 paper engine) and
+        # never waits indefinitely on a lock. We commit once per source snapshot so
+        # the write lock is held in short bursts instead of for the whole job — a
+        # long single transaction here is what previously wedged /api/prices/all.
+        dest_conn = _sqlite3.connect(dest_db, timeout=10)
         total_inserted = 0
-        for src_db in candidates:
-            try:
-                src_conn = _sqlite3.connect(src_db)
-                tables = [t[0] for t in src_conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()]
-                for tbl in tables:
-                    # Ensure destination table exists with the same schema
-                    ddl = src_conn.execute(
-                        f"SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (tbl,)
-                    ).fetchone()
-                    if ddl and ddl[0]:
-                        dest_conn.execute(ddl[0].replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
-                        dest_conn.execute(
-                            f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{tbl}_ts ON {tbl}(timestamp)"
-                        )
-                    rows = src_conn.execute(
-                        f"SELECT timestamp, open, high, low, close, volume FROM {tbl}"
-                    ).fetchall()
-                    inserted = 0
-                    for row in rows:
+        latest = {}
+        try:
+            dest_conn.execute("PRAGMA journal_mode=WAL")
+            dest_conn.execute("PRAGMA busy_timeout=10000")
+            for src_db in candidates:
+                src_conn = None
+                temp_db = None
+                try:
+                    import shutil
+                    import tempfile
+
+                    # Skip files whose mtime hasn't changed since the last successful
+                    # merge — avoids re-copying every historical snapshot over SMB
+                    # each cycle, which is the main source of sync lag.
+                    try:
+                        _cur_mtime = os.path.getmtime(src_db)
+                    except Exception:
+                        _cur_mtime = None
+                    if _cur_mtime is not None and _synced_mtimes.get(src_db) == _cur_mtime:
+                        continue
+
+                    # Copy ONLY the main .db from the I drive to local temp. We do
+                    # NOT copy the -wal/-shm sidecars, and this is deliberate:
+                    #   * On the live source the -wal is held with a byte-range lock
+                    #     (Windows error 33). The old code copied the sidecars inside
+                    #     the same try-block, so that lock raised and the `continue`
+                    #     skipped the ENTIRE snapshot — which is why the local DB
+                    #     froze (e.g. stuck at 00:00 while the source had 01:00).
+                    #   * SQLite also cannot replay a WAL read-only over the SMB
+                    #     network share (it needs -shm shared memory; opening the
+                    #     source ro/backup yields "file is not a database").
+                    # The source auto-checkpoints into its main .db, so the copied
+                    # main file carries everything up to the last checkpoint, and
+                    # INSERT OR IGNORE folds in the new rows each cycle. Worst case
+                    # we trail the source's un-checkpointed WAL tail by one
+                    # checkpoint interval instead of being frozen indefinitely.
+                    temp_dir = tempfile.gettempdir()
+                    base_name = os.path.basename(src_db)
+                    temp_db = os.path.join(temp_dir, base_name)
+
+                    # Remove stale sidecars so the temp copy always starts clean.
+                    for _ext in ("-wal", "-shm"):
                         try:
-                            dest_conn.execute(
-                                f"INSERT OR IGNORE INTO {tbl} (timestamp, open, high, low, close, volume) VALUES (?,?,?,?,?,?)",
-                                row,
-                            )
-                            inserted += dest_conn.execute("SELECT changes()").fetchone()[0]
+                            if os.path.exists(temp_db + _ext):
+                                os.remove(temp_db + _ext)
                         except Exception:
                             pass
-                    total_inserted += inserted
-                src_conn.close()
-            except Exception as e:
-                logger.error(f"DB sync: failed merging {src_db}: {e}")
-        dest_conn.commit()
-        dest_conn.close()
-        if total_inserted:
-            logger.info(f"DB sync: merged {len(candidates)} snapshot(s), inserted {total_inserted} new rows into bars_15min_latest.db")
-        else:
-            logger.info(f"DB sync: no new rows from {len(candidates)} snapshot(s)")
+
+                    try:
+                        shutil.copy2(src_db, temp_db)
+                    except Exception as copy_err:
+                        logger.warning(f"DB sync: copy failed for {src_db} - {copy_err}")
+                        continue
+                    # Cache mtime now that the copy succeeded; historical files with
+                    # unchanged mtime will be skipped on the next cycle.
+                    if _cur_mtime is not None:
+                        _synced_mtimes[src_db] = _cur_mtime
+
+                    # Best-effort WAL copy: the WAL file holds un-checkpointed rows
+                    # (often 1-3 hours of live data). The -shm is always byte-range
+                    # locked on Windows so we skip it — SQLite creates its own when
+                    # opening the temp copy. If the WAL copy fails we fall back to
+                    # main-db-only (immutable=1); if it succeeds we use mode=ro so
+                    # SQLite replays it automatically.
+                    _wal_copied = False
+                    try:
+                        shutil.copy2(src_db + "-wal", temp_db + "-wal")
+                        _wal_copied = True
+                    except Exception:
+                        pass
+                    _open_uri = f"file:{temp_db}?mode=ro" if _wal_copied else f"file:{temp_db}?immutable=1"
+
+                    src_conn = _sqlite3.connect(_open_uri, uri=True, timeout=10)
+                    tables = [t[0] for t in src_conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()]
+                    before = dest_conn.total_changes
+                    skipped = []
+                    for tbl in tables:
+                        # Merge each table independently and commit per table, so a
+                        # corrupt table in the source ("database disk image is
+                        # malformed") only skips that table instead of aborting the
+                        # whole snapshot — the readable contract tables still import.
+                        try:
+                            ddl = src_conn.execute(
+                                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (tbl,)
+                            ).fetchone()
+                            if ddl and ddl[0]:
+                                dest_conn.execute(ddl[0].replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
+                                dest_conn.execute(
+                                    f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{tbl}_ts ON {tbl}(timestamp)"
+                                )
+                            rows = src_conn.execute(
+                                f"SELECT timestamp, open, high, low, close, volume FROM {tbl}"
+                            ).fetchall()
+                            dest_conn.executemany(
+                                f"INSERT OR IGNORE INTO {tbl} (timestamp, open, high, low, close, volume) VALUES (?,?,?,?,?,?)",
+                                rows,
+                            )
+                            dest_conn.commit()  # persist this table; release the lock
+                        except Exception as te:
+                            try:
+                                dest_conn.rollback()
+                            except Exception:
+                                pass
+                            skipped.append(tbl)
+                    if skipped:
+                        logger.warning(
+                            f"DB sync: {os.path.basename(src_db)} — skipped {len(skipped)} unreadable table(s): {', '.join(skipped[:8])}"
+                            + (" ..." if len(skipped) > 8 else "")
+                        )
+                    total_inserted += max(0, dest_conn.total_changes - before)
+                except Exception as e:
+                    logger.error(f"DB sync: failed merging {src_db}: {e}")
+                    try:
+                        dest_conn.rollback()
+                    except Exception:
+                        pass
+                finally:
+                    if src_conn is not None:
+                        src_conn.close()
+                    if temp_db:
+                        for ext in ["", "-wal", "-shm"]:
+                            try:
+                                if os.path.exists(temp_db + ext):
+                                    os.remove(temp_db + ext)
+                            except Exception:
+                                pass
+            # Freshness readout — the latest WTI/Brent 15-min bar now in the local DB.
+            for _pfx, _name in (("CL", "WTI"), ("CO", "Brent")):
+                try:
+                    _tabs = [r[0] for r in dest_conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?", (_pfx + "_%",)
+                    ).fetchall()]
+                    latest[_name] = max(
+                        (dest_conn.execute(f"SELECT MAX(timestamp) FROM {t}").fetchone()[0] or "" for t in _tabs),
+                        default="",
+                    )
+                except Exception:
+                    pass
+        finally:
+            dest_conn.close()
+        logger.info(
+            f"DB sync: {len(candidates)} snapshot(s), +{total_inserted} new row(s); "
+            f"latest WTI={latest.get('WTI') or '?'} Brent={latest.get('Brent') or '?'}"
+        )
 
     async def _trigger_db_sync():
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _run_db_sync_blocking)
 
+    async def _trigger_gdelt_scrape():
+        from services.gdelt_fetcher import scrape_one_cycle
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, scrape_one_cycle)
+
     # Initialize APScheduler for precision background cron tasks
     scheduler = AsyncIOScheduler()
     scheduler.add_job(_trigger_db_sync, "interval", minutes=1, id="db_sync_pipeline", next_run_time=datetime.now())
+    # GDELT: every 2 min; staggered 30 s after startup so it doesn't race the
+    # db-sync on boot. Each cycle: ~15 s of requests (10 queries × 1.5 s) plus
+    # the backward-pass window advancing one day further into history.
+    scheduler.add_job(
+        _trigger_gdelt_scrape, "interval", minutes=2, id="gdelt_scrape",
+        next_run_time=datetime.now() + timedelta(seconds=30),
+    )
     scheduler.start()
     app.state.scheduler = scheduler
 
@@ -562,7 +709,7 @@ def get_eia_weekly_anchor():
 
         # Fetch 5yr averages concurrently
         averages = {}
-        with ThreadPoolExecutor(max_workers=min(10, len(EIAFetcher.SERIES))) as executor:
+        with ThreadPoolExecutor(max_workers=min(3, len(EIAFetcher.SERIES))) as executor:
             future_to_name = {
                 executor.submit(EIAFetcher.calculate_5yr_avg, series_id): name
                 for name, series_id in EIAFetcher.SERIES.items()
@@ -653,9 +800,22 @@ def get_all_macro():
 
 
 # ==================== SIGNALS ENDPOINTS ====================
+# Short-lived cache for the composite endpoint. It is expensive (history +
+# multi-factor for 17 symbols) and its inputs only move on the ~60s signal
+# cadence, so caching the response for a few seconds makes dashboard reloads and
+# polls instant without serving anything staler than the WebSocket already does.
+_COMPOSITE_CACHE: dict = {"ts": 0.0, "resp": None}
+_COMPOSITE_TTL = 30.0  # seconds
+
+
 @app.get("/api/signals/composite")
 def get_composite_signal():
     """Get composite trading signal — uses multi-factor engine for WTI."""
+    import time as _time
+    now_ts = _time.time()
+    cached_resp = _COMPOSITE_CACHE.get("resp")
+    if cached_resp is not None and (now_ts - _COMPOSITE_CACHE.get("ts", 0.0)) < _COMPOSITE_TTL:
+        return cached_resp
     try:
         with ThreadPoolExecutor(max_workers=3) as executor:
             future_prices = executor.submit(PriceFetcher.fetch_all_prices)
@@ -759,40 +919,39 @@ def get_composite_signal():
             "WTI-Brent", "DUB-WTI"
         ]
         
-        for sym in all_target_symbols:
-            if sym == "WTI":
-                sym_ai = _latest_intraday.get("WTI", {})
-                by_symbol["WTI"] = {
-                    "composite_score": adjusted_score,
-                    "regime": sym_ai.get("regime_state", {}).get("regime_label", "BULLISH" if adjusted_score > 30 else "BEARISH" if adjusted_score < -30 else "NEUTRAL"),
-                    "regime_type": sym_ai.get("regime_state", {}).get("severity", mf_result.get("regime_type", "UNKNOWN")),
-                    "signal": sym_ai.get("trade_signal", {}).get("direction", mf_result.get("signal", "NEUTRAL")),
-                    "sub_scores": sub,
-                    "weights": mf_result.get("factor_weights", {}),
-                    "volatility_pct": round(vol, 1),
-                    "vol_regime": vol_regime,
-                    "factor_scores": mf_result.get("factor_scores", {}),
-                }
-            else:
+        # WTI uses the multi-factor result already computed above (with the news
+        # adjustment), so build it inline.
+        by_symbol["WTI"] = {
+            "composite_score": adjusted_score,
+            "regime": wti_ai.get("regime_state", {}).get("regime_label", "BULLISH" if adjusted_score > 30 else "BEARISH" if adjusted_score < -30 else "NEUTRAL"),
+            "regime_type": wti_ai.get("regime_state", {}).get("severity", mf_result.get("regime_type", "UNKNOWN")),
+            "signal": wti_ai.get("trade_signal", {}).get("direction", mf_result.get("signal", "NEUTRAL")),
+            "sub_scores": sub,
+            "weights": mf_result.get("factor_weights", {}),
+            "volatility_pct": round(vol, 1),
+            "vol_regime": vol_regime,
+            "factor_scores": mf_result.get("factor_scores", {}),
+        }
+
+        # The other 16 symbols are independent (each = one history fetch + one
+        # multi-factor computation). This loop was the bulk of the endpoint's ~18s
+        # latency when run sequentially; fan it out across a threadpool so the wall
+        # time collapses to roughly the slowest single symbol. Each worker is
+        # self-contained and swallows its own errors so one bad symbol cannot 500
+        # the whole endpoint.
+        def _compute_symbol(sym):
+            try:
                 hist = PriceFetcher.fetch_historical(sym, "3mo")
                 prices_list = [float(h["close"]) for h in (hist or [])] if hist else []
                 sym_mf = compute_multi_factor_score(
-                    symbol=sym,
-                    candles=hist or [],
-                    macro=macro,
-                    eia_data=None,
-                    cftc_data=None,
+                    symbol=sym, candles=hist or [], macro=macro, eia_data=None, cftc_data=None,
                 ) if hist else {}
-                
                 sym_vol = SignalCalculator.calculate_realized_volatility(prices_list) if prices_list else 0.0
                 sym_vol_regime = SignalCalculator.get_vol_regime(sym_vol) if prices_list else "NORMAL"
-                
                 sym_sub = sym_mf.get("sub_scores", {})
                 sym_sub["news_sentiment"] = round(news_sentiment, 3)
-                
                 sym_ai = _latest_intraday.get(sym, {})
-                
-                by_symbol[sym] = {
+                return sym, {
                     "composite_score": sym_mf.get("composite_score", 0.0),
                     "regime": sym_ai.get("regime_state", {}).get("regime_label", sym_mf.get("regime", "NEUTRAL")),
                     "regime_type": sym_ai.get("regime_state", {}).get("severity", sym_mf.get("regime_type", "UNKNOWN")),
@@ -803,8 +962,16 @@ def get_composite_signal():
                     "vol_regime": sym_vol_regime,
                     "factor_scores": sym_mf.get("factor_scores", {}),
                 }
+            except Exception as sym_err:
+                logger.warning(f"composite: failed to compute {sym}: {sym_err}")
+                return sym, {}
+
+        other_symbols = [s for s in all_target_symbols if s != "WTI"]
+        with ThreadPoolExecutor(max_workers=min(8, len(other_symbols))) as executor:
+            for sym, data in executor.map(_compute_symbol, other_symbols):
+                by_symbol[sym] = data
         
-        return {
+        result = {
             "status": "success",
             "data": {
                 "composite_score":  adjusted_score,
@@ -843,6 +1010,9 @@ def get_composite_signal():
                 "by_symbol":        by_symbol,
             },
         }
+        _COMPOSITE_CACHE["resp"] = result
+        _COMPOSITE_CACHE["ts"] = now_ts
+        return result
     except Exception as e:
         logger.error(f"Error calculating composite signal: {e}")
         return JSONResponse(
@@ -1337,10 +1507,18 @@ async def get_all_recent_trades():
 
 # ==================== PAPER TRADING ENDPOINT ====================
 @app.get('/api/paper/state')
-def get_paper_state():
-    """Return current paper trading book state."""
+def get_paper_state(recent: int = 0):
+    """Return current paper trading book state.
+
+    Args:
+        recent: If > 0, only include the last N closed_trades in the response
+                (stats like total_trades and win_rate still reflect ALL trades).
+                Use recent=10 for lightweight overview polling.
+    """
     try:
         state = paper_book.get_state()
+        if recent > 0:
+            state = {**state, "closed_trades": state["closed_trades"][-recent:]}
         return {"status": "success", "data": state, "timestamp": datetime.now().isoformat()}
     except Exception as e:
         logger.error(f"Error fetching paper state: {e}")
@@ -1732,6 +1910,243 @@ async def acknowledge_alert(alert_id: str, db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"Error acknowledging alert: {e}")
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+# ==================== DISRUPTION INTELLIGENCE ENDPOINTS ====================
+
+@app.get("/api/disruption/matrix")
+def get_disruption_matrix():
+    """
+    Full node × contract impact matrix, computed from EIA daily spot event studies.
+    Returns all 15 nodes with history matrix, structural prior, confidence, and analog list.
+    """
+    try:
+        from services.eia_event_engine import get_full_impact_matrix
+        data = get_full_impact_matrix()
+        return {"status": "success", "data": data, "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error(f"Disruption matrix error: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.get("/api/disruption/nodes")
+def get_disruption_nodes():
+    """
+    Summarised view of all 15 nodes: criticality, analog count, headline impact,
+    confidence badge, region, and channel flags. Used to populate the node grid.
+    """
+    try:
+        from services.eia_event_engine import get_full_impact_matrix
+        from services.oil_nodes import NODE_DEFINITIONS
+        matrix = get_full_impact_matrix()
+        nodes_out = []
+        for node in NODE_DEFINITIONS:
+            nid   = node["id"]
+            entry = matrix.get("nodes", {}).get(nid, {})
+            headline = entry.get("headline", {})
+            # headline may be a history matrix dict or a prior dict
+            if isinstance(headline, dict) and "t0" in headline:
+                t0 = headline.get("t0", {})
+            else:
+                t0 = headline
+            nodes_out.append({
+                "id":            nid,
+                "name":          node["name"],
+                "type":          node["type"],
+                "throughput_mbd":node["throughput_mbd"],
+                "criticality":   node["criticality"],
+                "region":        node["region"],
+                "channels":      node["channels"],
+                "product_exposure": node["product_exposure"],
+                "analog_count":  entry.get("analog_count", 0),
+                "confidence":    entry.get("confidence", "STRUCTURAL"),
+                "headline_source":entry.get("headline_source", "prior"),
+                "wti_pct_t0":    t0.get("wti_pct"),
+                "brent_pct_t0":  t0.get("brent_pct"),
+                "arb_usd_t0":    t0.get("arb_usd"),
+                "crack_usd_t0":  t0.get("crack_usd"),
+                "notes":         node.get("notes", ""),
+            })
+        return {"status": "success", "data": nodes_out, "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error(f"Disruption nodes error: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.get("/api/disruption/node/{node_id}")
+def get_disruption_node_detail(node_id: str):
+    """
+    Full detail for one node: T+0..T+20 matrix split by channel, all analogues,
+    structural prior, confidence metrics.
+    """
+    try:
+        from services.eia_event_engine import get_full_impact_matrix
+        from services.oil_nodes import NODE_BY_ID
+        matrix = get_full_impact_matrix()
+        node   = NODE_BY_ID.get(node_id)
+        if not node:
+            return JSONResponse(status_code=404, content={"status": "error", "message": "Unknown node"})
+        entry  = matrix.get("nodes", {}).get(node_id, {})
+        return {"status": "success", "data": {**node, **entry}, "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error(f"Node detail error: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.get("/api/disruption/catalog")
+def get_disruption_catalog():
+    """
+    Full ACLED-style event catalog: 20 real disruptions with node, channel,
+    severity, source triangulation metadata, and computed T+0..T+20 returns.
+    """
+    try:
+        from services.eia_event_engine import get_full_impact_matrix
+        from services.event_catalog import DISRUPTION_EVENTS
+        matrix = get_full_impact_matrix()
+        all_returns = {r["event_id"]: r for r in matrix.get("all_event_returns", [])}
+        enriched = []
+        for ev in DISRUPTION_EVENTS:
+            ret = all_returns.get(ev["event_id"], {})
+            enriched.append({**ev, "computed": {k: v for k, v in ret.items() if k.startswith("t")}})
+        return {"status": "success", "data": enriched, "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error(f"Catalog error: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.get("/api/disruption/news")
+def get_disruption_news(timespan: str = "3d", total: int = 50):
+    """
+    Oil-energy news feed: GDELT (primary) → EIA RSS (fallback), each item
+    pre-classified and clustered into events. Includes ACLED node-risk overlay.
+    Honesty: returns headline + URL only; never stores full paywalled text.
+    """
+    try:
+        from services.gdelt_fetcher import (
+            get_stored_feed, get_scrape_status, cluster_articles,
+        )
+        from services.disruption_classifier import classify_feed_item
+
+        # ── 1. Source selection ──────────────────────────────────────────────
+        feed_source = "empty"
+        raw_items: list = []
+
+        # a) GDELT local DB (populated by background scraper)
+        stored = get_stored_feed(timespan=timespan, total=total * 3)
+        if stored:
+            raw_items   = cluster_articles(stored)[:total]
+            feed_source = "gdelt_db"
+        else:
+            # b) GDELT live API (quick single-query attempt with short timeout)
+            try:
+                from services.gdelt_fetcher import fetch_gdelt_articles
+                live = fetch_gdelt_articles(timespan=timespan, max_records=total, query_idx=0)
+                if live:
+                    raw_items   = cluster_articles(live)[:total]
+                    feed_source = "gdelt_live"
+            except Exception:
+                pass
+
+        # c) EIA Today in Energy RSS (fallback — works when GDELT is blocked)
+        if not raw_items:
+            try:
+                from services.eia_rss_fetcher import fetch_eia_rss
+                raw_items   = fetch_eia_rss(max_items=total)
+                feed_source = "eia_rss" if raw_items else "empty"
+            except Exception:
+                pass
+
+        # ── 2. Classify each item ────────────────────────────────────────────
+        enriched = []
+        for item in raw_items:
+            cls = {}
+            try:
+                cls = classify_feed_item(item)
+            except Exception:
+                pass
+            enriched.append({**item, "classification": cls or {}})
+
+        # ── 3. ACLED node-risk overlay ───────────────────────────────────────
+        acled_events: list = []
+        node_risks: dict   = {}
+        try:
+            from services.acled_fetcher import get_acled_events, get_node_risk_overlay
+            acled_events = get_acled_events(days=30)
+            node_risks   = get_node_risk_overlay(acled_events)
+        except Exception as e:
+            logger.debug("ACLED overlay skipped: %s", e)
+
+        # ── 4. Feed status metadata for frontend ─────────────────────────────
+        scrape_status = {}
+        try:
+            scrape_status = get_scrape_status()
+        except Exception:
+            pass
+
+        source_labels = {
+            "gdelt_db":   "GDELT database (scraped)",
+            "gdelt_live": "GDELT live API",
+            "eia_rss":    "EIA Today in Energy RSS (GDELT unavailable from this network)",
+            "empty":      "No feed available — GDELT unreachable and EIA RSS empty",
+        }
+        feed_status = {
+            "source":          feed_source,
+            "gdelt_db_count":  scrape_status.get("total_articles", 0),
+            "gdelt_reachable": feed_source in ("gdelt_db", "gdelt_live"),
+            "last_scrape":     scrape_status.get("latest_fetched"),
+            "message":         f"{len(enriched)} items · {source_labels.get(feed_source, feed_source)}",
+        }
+
+        return {
+            "status":       "success",
+            "data":         enriched,
+            "acled_events": acled_events[:50],
+            "node_risks":   node_risks,
+            "feed_status":  feed_status,
+            "count":        len(enriched),
+            "timestamp":    datetime.now().isoformat(),
+        }
+    except Exception as e:
+        logger.error("Disruption news error: %s", e)
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.get("/api/disruption/status")
+def get_disruption_status():
+    """Scrape health + DB stats for the news feed monitor."""
+    try:
+        from services.gdelt_fetcher import get_scrape_status
+        scrape = get_scrape_status()
+        acled_avail = bool(
+            __import__("os").getenv("ACLED_KEY") and __import__("os").getenv("ACLED_EMAIL")
+        )
+        return {
+            "status":  "success",
+            "gdelt":   scrape,
+            "acled_available": acled_avail,
+            "timestamp": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.post("/api/disruption/classify")
+async def classify_disruption_text(payload: dict):
+    """
+    Classify a free-text headline or typed news item.
+    Returns: node, channel, region, severity, restored, mostExposedContract,
+    confidence, expected impact, historical analogs, structural prior.
+    """
+    try:
+        from services.disruption_classifier import classify
+        text = payload.get("text", "").strip()
+        if not text:
+            return JSONResponse(status_code=400, content={"status": "error", "message": "text required"})
+        result = await asyncio.get_event_loop().run_in_executor(None, classify, text)
+        return {"status": "success", "data": result, "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error(f"Classify error: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
 
 frontend_path = os.path.join(os.path.dirname(__file__), '..', 'frontend', 'dist')
 if os.path.isdir(frontend_path):

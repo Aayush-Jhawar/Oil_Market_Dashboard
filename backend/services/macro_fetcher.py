@@ -191,9 +191,10 @@ class RigCountFetcher:
     def fetch_latest() -> Optional[Dict]:
         import json
         import os
-        
+        import time
+
         cache_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rig_count_cache.json")
-        
+
         # Default fallback estimates matching the most recent successfully parsed report (June 5, 2026)
         fallback_data = {
             "total_us_oil_rigs": 486,
@@ -203,6 +204,31 @@ class RigCountFetcher:
             "data_source": "baker_hughes_cache",
             "timestamp": datetime.now().isoformat(),
         }
+
+        # Baker Hughes publishes the rig count WEEKLY, so re-scraping their site on
+        # every /api/rigs/latest call is wasteful and slow: it does two sequential
+        # web requests plus an Excel parse and can take 30-60s. That single slow
+        # call stalls the dashboard's initial load gate (Promise.allSettled over all
+        # endpoints), leaving the whole UI stuck on "Loading dashboard..." and the
+        # tabs effectively unclickable. Serve a recent cache instantly; only touch
+        # the network when the cache is missing or older than RIG_CACHE_TTL.
+        RIG_CACHE_TTL = 12 * 3600   # live data is good for 12h (weekly release)
+        RIG_FAIL_RETRY = 3600       # when the site is down, retry at most hourly
+        try:
+            if os.path.exists(cache_file):
+                age = time.time() - os.path.getmtime(cache_file)
+                with open(cache_file, "r") as f:
+                    cached = json.load(f)
+                # Live data is trusted for 12h; a fallback/cache-only write is only
+                # trusted for 1h so we re-attempt the live scrape sooner once the
+                # Baker Hughes site recovers — but never on every single load.
+                ttl = RIG_CACHE_TTL if cached.get("data_source") == "baker_hughes_live" else RIG_FAIL_RETRY
+                if age < ttl:
+                    out = dict(cached)
+                    out["data_source"] = "baker_hughes_cache"
+                    return out
+        except Exception as cache_err:
+            logger.warning(f"RigCountFetcher: cache read failed, will refetch: {cache_err}")
 
         try:
             import requests
@@ -221,10 +247,13 @@ class RigCountFetcher:
             }
             
             session = requests.Session()
-            adapter = requests.adapters.HTTPAdapter(max_retries=2)
+            # No retries and tight (connect, read) timeouts so a slow/unreachable
+            # Baker Hughes site fails fast to the cache/fallback instead of hanging
+            # the request (and the dashboard load) for up to a minute.
+            adapter = requests.adapters.HTTPAdapter(max_retries=0)
             session.mount('https://', adapter)
-            
-            resp = session.get(url, headers=headers, verify=False, timeout=10)
+
+            resp = session.get(url, headers=headers, verify=False, timeout=(4, 8))
             html = resp.text
             
             soup = BeautifulSoup(html, 'html.parser')
@@ -253,7 +282,7 @@ class RigCountFetcher:
                 excel_url = "https://bakerhughesrigcount.gcs-web.com" + excel_url
                 
             logger.info(f"RigCountFetcher: downloading Excel from {excel_url}")
-            excel_resp = session.get(excel_url, headers=headers, verify=False, timeout=10)
+            excel_resp = session.get(excel_url, headers=headers, verify=False, timeout=(4, 8))
             excel_data = BytesIO(excel_resp.content)
             
             # Parse Detail sheet
@@ -306,15 +335,24 @@ class RigCountFetcher:
             
         except Exception as e:
             logger.error(f"RigCountFetcher error (falling back to cache): {e}")
+            out = dict(fallback_data)
             if os.path.exists(cache_file):
                 try:
                     with open(cache_file, 'r') as f:
                         cached = json.load(f)
-                        cached["data_source"] = "baker_hughes_cache"
-                        return cached
+                    out = dict(cached)
+                    out["data_source"] = "baker_hughes_cache"
                 except Exception as read_err:
                     logger.error(f"RigCountFetcher: failed to read cache: {read_err}")
-            return fallback_data
+            # Persist (touch) so we do NOT re-hit the dead site on every dashboard
+            # load — the refreshed mtime + non-"live" data_source throttles retries
+            # to RIG_FAIL_RETRY instead of paying the timeout on every request.
+            try:
+                with open(cache_file, 'w') as f:
+                    json.dump(out, f, indent=2)
+            except Exception:
+                pass
+            return out
 
 
 class CFTCFetcher:

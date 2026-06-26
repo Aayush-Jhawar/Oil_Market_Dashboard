@@ -111,7 +111,12 @@ class PriceFetcher:
         "RBOB": {"symbol": "RBOB", "open": 84.0, "high": 86.1, "low": 81.9, "close": 85.05, "volume": 0, "change_pct": 0.0},
         "HO": {"symbol": "HO", "open": 96.6, "high": 98.7, "low": 94.5, "close": 97.44, "volume": 0, "change_pct": 0.0},
         "JET": {"symbol": "JET", "open": 155.0, "high": 158.0, "low": 152.0, "close": 156.5, "volume": 0, "change_pct": 0.0},
-        "GO": {"symbol": "GO", "open": 700.0, "high": 710.0, "low": 690.0, "close": 705.0, "volume": 0, "change_pct": 0.0},
+        # NOTE: GO (ICE Gasoil) intentionally has NO static fallback. Yahoo no
+        # longer serves a working gasoil ticker (G0=F / QS=F return empty), so a
+        # hardcoded close here would surface as a fake, frozen $705 price in the
+        # top bar. With no entry, _get_fallback_price returns None and the GO pill
+        # renders "—" (no data) instead of a fabricated number. Wire a real gasoil
+        # feed here if one becomes available.
         "HH": {"symbol": "HH", "open": 3.4, "high": 3.5, "low": 3.3, "close": 3.41, "volume": 0, "change_pct": 0.0},
         "NG": {"symbol": "NG", "open": 3.4, "high": 3.5, "low": 3.3, "close": 3.41, "volume": 0, "change_pct": 0.0},
         "DXY": {"symbol": "DXY", "open": 104.0, "high": 104.5, "low": 103.5, "close": 104.2, "volume": 0, "change_pct": 0.0},
@@ -224,10 +229,10 @@ class PriceFetcher:
             import os
             from datetime import datetime
             
-            # Locate the bars_15min_latest.db file
+            # Locate the bars_15min_latest.db file (local, non-synced — see config)
             base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-            db_path = os.path.join(base_dir, "DB", "bars_15min_latest.db")
-            
+            db_path = os.environ.get("BARS15_DB_PATH") or os.path.join(base_dir, "DB", "bars_15min_latest.db")
+
             if not os.path.exists(db_path):
                 return None
                 
@@ -253,15 +258,44 @@ class PriceFetcher:
             
             tables.sort(key=parse_contract)
             
+            # Find the global max timestamp across all tables.
+            # Exclude tables whose MAX(timestamp) is more than 1 day in the
+            # future — those have corrupt/far-dated rows (e.g. CO_Q27) that
+            # would skew the cutoff and cause all near-term contracts to fail.
+            from datetime import datetime, timedelta
+            _now_ceil = (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+            table_max_ts = {}
+            global_max = ""
+            for t in tables:
+                row = conn.execute(f"SELECT MAX(timestamp) FROM {t}").fetchone()
+                if row and row[0]:
+                    ts = row[0].replace("T", " ")[:19]
+                    if ts > _now_ceil:
+                        continue  # corrupt far-future timestamp — skip
+                    table_max_ts[t] = row[0]
+                    if row[0] > global_max:
+                        global_max = row[0]
+
             latest_row = None
             latest_table = ""
-            
-            for t in tables:
-                row = conn.execute(f"SELECT timestamp, open, high, low, close, volume FROM {t} ORDER BY timestamp DESC LIMIT 1").fetchone()
-                if row:
-                    latest_row = row
-                    latest_table = t
-                    break  # Found the front-most contract with data
+
+            if global_max:
+                try:
+                    clean_max = global_max.replace("T", " ")[:19]
+                    max_dt = datetime.strptime(clean_max, "%Y-%m-%d %H:%M:%S")
+                    cutoff_str = (max_dt - timedelta(days=4)).strftime("%Y-%m-%d %H:%M:%S")
+                except:
+                    cutoff_str = global_max
+
+                for t in tables:
+                    ts = table_max_ts.get(t, "")
+                    clean_ts = ts.replace("T", " ")[:19]
+                    if clean_ts >= cutoff_str:
+                        row = conn.execute(f"SELECT timestamp, open, high, low, close, volume FROM {t} ORDER BY timestamp DESC LIMIT 1").fetchone()
+                        if row:
+                            latest_row = row
+                            latest_table = t
+                            break  # Found the active front-most contract with recent data
                     
             conn.close()
             
@@ -988,7 +1022,7 @@ class PriceFetcher:
             import sqlite3
             import os
             base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-            db_path = os.path.join(base_dir, "DB", "bars_15min_latest.db")
+            db_path = os.environ.get("BARS15_DB_PATH") or os.path.join(base_dir, "DB", "bars_15min_latest.db")
             if not os.path.exists(db_path):
                 return []
             prefix = "CL" if symbol == "WTI" else ("CO" if symbol in ("Brent", "BRN") else None)
@@ -1009,7 +1043,39 @@ class PriceFetcher:
             if not tables:
                 return []
                 
-            front_month = tables[0]
+            # Find the active front-month contract by checking the max timestamp.
+            # Skip tables with corrupt far-future timestamps (same guard as _fetch_live_db_price).
+            from datetime import datetime, timedelta
+            _now_ceil = (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+            table_max_ts = {}
+            global_max = ""
+            for t in tables:
+                row = conn.execute(f"SELECT MAX(timestamp) FROM {t}").fetchone()
+                if row and row[0]:
+                    ts = row[0].replace("T", " ")[:19]
+                    if ts > _now_ceil:
+                        continue  # corrupt far-future timestamp — skip
+                    table_max_ts[t] = row[0]
+                    if row[0] > global_max:
+                        global_max = row[0]
+
+            active_index = 0
+            if global_max:
+                try:
+                    clean_max = global_max.replace("T", " ")[:19]
+                    max_dt = datetime.strptime(clean_max, "%Y-%m-%d %H:%M:%S")
+                    cutoff_str = (max_dt - timedelta(days=4)).strftime("%Y-%m-%d %H:%M:%S")
+                except:
+                    cutoff_str = global_max
+
+                for i, t in enumerate(tables):
+                    ts = table_max_ts.get(t, "")
+                    clean_ts = ts.replace("T", " ")[:19]
+                    if clean_ts >= cutoff_str:
+                        active_index = i
+                        break
+                        
+            front_month = tables[active_index]
             query = f"""
                 SELECT DATE(timestamp) as d, 
                        (SELECT open FROM {front_month} t2 WHERE DATE(t2.timestamp) = DATE(t1.timestamp) ORDER BY t2.timestamp ASC LIMIT 1) as o,

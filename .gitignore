@@ -71,5 +71,12 @@ eia_inventory_analysis/report/
 eia_inventory_analysis_v2/output/
 eia_inventory_analysis_v2/_*
 
+# Runtime paper-trading engine state — regenerated on each boot, never ship
+# (committing it would make a deploy resume stale instead of booting clean).
+backend/data/bars15_engine_state.json
+
 # TypeScript build info
 *.tsbuildinfo
+
+eia_inventory_analysis/
+eia_inventory_analysis_v2/

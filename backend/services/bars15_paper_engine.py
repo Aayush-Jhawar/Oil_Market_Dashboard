@@ -40,8 +40,16 @@ BASE_TO_PRODUCT = {"WTI": "CL", "Brent": "CO"}
 
 TICK_SIZE = 0.01                  # 1 tick = $0.01
 WARMUP_BARS = 20                  # 20-bar rolling window (journal 15-min spec)
-STOP_Z = 3.0                      # stop loss at |z| > 3.0
-TIMEOUT_BARS = 8                  # force exit after 8 bars (~2h on 15-min)
+STOP_Z = 3.0                      # legacy z-extreme (kept for reference; exits are now price-level based)
+# Risk levels are anchored to the actual ENTRY FILL, not the rolling mean, so the
+# stop is ALWAYS a real distance beyond the entry (correct side) even when the fill
+# overshoots the mean at high |z| — this removes the "stop < entry on a short" /
+# born-past-stop artifact without throwing the signal away.
+#   * STOP_SIGMA: stop placed this many rolling-std beyond the fill (loss side).
+#   * TP_SIGMA:   take-profit this many std back toward the mean (profit side),
+#                 capped at the mean so we never target *past* full reversion.
+STOP_SIGMA = float(os.getenv("PAPER_STOP_SIGMA", "2.0"))
+TP_SIGMA = float(os.getenv("PAPER_TP_SIGMA", "1.5"))
 COOLDOWN_BARS = 4                 # bars to sit out after a stop loss
 MAX_CONCURRENT = int(os.getenv("PAPER_MAX_CONCURRENT", "12"))  # portfolio position cap
 
@@ -534,18 +542,26 @@ def run_replay(db_dir: str, starting_equity: float = 0.0) -> Optional[Dict]:
         if pos is not None:
             bars_held = i - pos["entry_i"]
             reason = None
-            if abs(z_prev) > STOP_Z:
-                reason = "Stop Loss"
-                cooldown[si] = COOLDOWN_BARS
-            elif bars_held >= TIMEOUT_BARS:
-                # Time stop: a mean-reversion trade that has not reverted within
-                # TIMEOUT_BARS is exited at market. Without this, positions are
-                # held indefinitely until they revert, which manufactures an
-                # unrealistically high win rate by never realizing slow losers.
-                reason = "Timeout"
-            elif (pos["direction"] == "LONG" and z_prev >= 0) or \
-                 (pos["direction"] == "SHORT" and z_prev <= 0):
-                reason = "Mean Reversion Complete"
+            # Exit on the PREVIOUS closed bar's price (no lookahead) crossing the
+            # entry-anchored stop / target levels. Stop and target are real price
+            # levels set at entry, so the exit is consistent with what was shown on
+            # the trade — no more relying on a z-extreme that the fill may already
+            # have breached.
+            sig_price = s["bars"][i - 1][2]
+            stop_p = pos.get("stop_price")
+            tgt_p = pos.get("target_price")
+            if pos["direction"] == "LONG":
+                if stop_p is not None and sig_price <= stop_p:
+                    reason = "Stop Loss"
+                    cooldown[si] = COOLDOWN_BARS
+                elif tgt_p is not None and sig_price >= tgt_p:
+                    reason = "Mean Reversion Complete"
+            else:  # SHORT
+                if stop_p is not None and sig_price >= stop_p:
+                    reason = "Stop Loss"
+                    cooldown[si] = COOLDOWN_BARS
+                elif tgt_p is not None and sig_price <= tgt_p:
+                    reason = "Mean Reversion Complete"
 
             if reason:
                 gross = (fill - pos["entry_price"]) / TICK_SIZE
@@ -579,7 +595,7 @@ def run_replay(db_dir: str, starting_equity: float = 0.0) -> Optional[Dict]:
                     spread_name = parts[1]
 
                 # Map signal to user-friendly term
-                exit_reason = "TARGET" if reason == "Mean Reversion Complete" else "STOP" if reason == "Stop Loss" else "TIMEOUT"
+                exit_reason = "TARGET" if reason == "Mean Reversion Complete" else "STOP"
                 
                 # Formats like 06-15 14:30
                 try:
@@ -681,13 +697,25 @@ def run_replay(db_dir: str, starting_equity: float = 0.0) -> Optional[Dict]:
                     )
                     continue
 
-                # Z=0 is mean (target). Z=STOP_Z is stop.
-                target_price = mean_prev
+                # Entry-anchored risk levels (fill = current bar's open).
+                #   target: revert toward the mean, but capped at a realistic
+                #           TP_SIGMA move from the fill — whichever is NEARER the
+                #           fill. This stops the engine booking an inflated full
+                #           multi-sigma reversion when the fill overshoots (high |z|).
+                #   stop:   STOP_SIGMA beyond the fill on the loss side, so it is
+                #           always on the correct side of the entry by a real margin.
+                if direction == "LONG":
+                    # profit is upward: nearer target = the smaller of (mean, fill+TP)
+                    target_price = min(mean_prev, fill + TP_SIGMA * std_prev)
+                    stop_price = fill - STOP_SIGMA * std_prev
+                else:  # SHORT — profit is downward: nearer target = larger of (mean, fill-TP)
+                    target_price = max(mean_prev, fill - TP_SIGMA * std_prev)
+                    stop_price = fill + STOP_SIGMA * std_prev
 
-                # Profitability guard: the reversion target must clear the
-                # round-trip slippage. If the distance from the fill to the mean is
-                # not larger than the slippage charged on the trade, the position
-                # cannot make money even on a perfect reversion — so skip the signal.
+                # Profitability guard: the target must clear the round-trip slippage.
+                # If the fill-to-target distance is not larger than the slippage
+                # charged on the trade, it cannot make money even on a clean hit —
+                # so skip the signal.
                 entry_slip = SLIPPAGE_TICKS.get(spec["type"], 2.0)
                 target_ticks = abs(fill - target_price) / TICK_SIZE
                 if target_ticks <= entry_slip:
@@ -696,11 +724,6 @@ def run_replay(db_dir: str, starting_equity: float = 0.0) -> Optional[Dict]:
                         f"<= slippage {entry_slip} tk"
                     )
                     continue
-
-                if direction == "LONG":
-                    stop_price = mean_prev - (STOP_Z * std_prev)
-                else:
-                    stop_price = mean_prev + (STOP_Z * std_prev)
 
                 positions[si] = {
                     "entry_price": fill,
@@ -770,7 +793,7 @@ def run_replay(db_dir: str, starting_equity: float = 0.0) -> Optional[Dict]:
         "cum_ticks": round(cum_ticks, 1),
         "peak": round(peak, 1),
         "max_dd": round(max_dd, 1),
-        "closed_trades": all_closed[-1000:],
+        "closed_trades": all_closed,
         "pnl_curve": pnl_curve[-2000:],
         "traded": sorted(traded_syms),
         "positions": persist_positions,
@@ -779,7 +802,7 @@ def run_replay(db_dir: str, starting_equity: float = 0.0) -> Optional[Dict]:
 
     unrealized = round(sum(p["pnl"] for p in open_positions), 1)
     return {
-        "closed_trades": all_closed[-200:],
+        "closed_trades": all_closed,
         "open_positions": open_positions,
         "pnl_curve_ticks": pnl_curve[-1000:],
         "realized_pnl_ticks": round(cum_ticks, 1),
