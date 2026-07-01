@@ -123,7 +123,7 @@ function App() {
       }).catch(() => {})
 
       // Background: fetch per-symbol historical prices.
-      const historySymbols = ['WTI', 'Brent', 'RBOB', 'HO', 'GO', 'NG', '3-2-1CRACK', 'GASCRACK', 'DIESELCRACK', 'WTI-Brent', 'WTI_CAL_SPREAD', 'BRENT_CAL_SPREAD', 'WTI_FLY', 'BRENT_FLY', 'HO_FLY']
+      const historySymbols = ['WTI', 'Brent', 'RBOB', 'HO', 'GO', 'NG', '3-2-1CRACK', 'GASCRACK', 'DIESELCRACK', 'GASOILCRACK', 'WTI-Brent', 'WTI_CAL_SPREAD', 'BRENT_CAL_SPREAD', 'WTI_FLY', 'BRENT_FLY', 'HO_FLY']
       Promise.allSettled(
         historySymbols.map(async (symbol) => {
           try {
@@ -156,7 +156,7 @@ function App() {
               { id: 'overview' as DashboardTab, label: 'Overview' },
               { id: 'prices' as DashboardTab, label: 'Prices' },
               { id: 'spreads' as DashboardTab, label: 'Spreads' },
-              { id: 'news' as DashboardTab, label: 'News' },
+              { id: 'news' as DashboardTab, label: 'News & Forecast' },
               { id: 'anchor' as DashboardTab, label: 'EIA Anchors' },
               { id: 'prediction' as DashboardTab, label: 'Predictions' },
               // { id: 'backtest' as DashboardTab, label: 'Backtest' },

@@ -854,6 +854,25 @@ class PriceFetcher:
 
     @staticmethod
     def _fetch_crack_spread_historical(symbol: str, period: str) -> Optional[List[Dict]]:
+        import pandas as pd
+
+        # Gasoil crack = ICE gasoil (GO, $/bbl-equiv) − Brent. The European diesel
+        # refining margin. GO & Brent now carry deep DB history, so it's fully daily.
+        if symbol == "GASOILCRACK":
+            go = PriceFetcher.fetch_historical("GO", period)
+            brent = PriceFetcher.fetch_historical("Brent", period)
+            if not (go and brent):
+                return None
+            dg = pd.DataFrame(go).set_index("timestamp")["close"].rename("GO")
+            db_ = pd.DataFrame(brent).set_index("timestamp")["close"].rename("Brent")
+            crack = pd.concat([dg, db_], axis=1).dropna()
+            if crack.empty:
+                return None
+            spread = crack["GO"] - crack["Brent"]
+            return [{"timestamp": idx, "open": float(v), "high": float(v),
+                     "low": float(v), "close": float(v), "volume": 0.0}
+                    for idx, v in spread.items()]
+
         wti = PriceFetcher.fetch_historical("WTI", period)
         rbob = PriceFetcher.fetch_historical("RBOB", period)
         ho = PriceFetcher.fetch_historical("HO", period)
@@ -1107,9 +1126,90 @@ class PriceFetcher:
             return []
 
     @staticmethod
+    def _get_intraday_from_15min_db(symbol: str, bars: int = 180) -> List[Dict]:
+        """Recent raw 15-min bars of the active front-month contract (WTI/Brent) for
+        the intraday/spot chart. Same live DB as the daily EOD tail — not the stale
+        Data/ parquet."""
+        try:
+            import sqlite3
+            import os
+            from datetime import datetime, timedelta
+            base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            db_path = os.environ.get("BARS15_DB_PATH") or os.path.join(base_dir, "DB", "bars_15min_latest.db")
+            if not os.path.exists(db_path):
+                return []
+            prefix = "CL" if symbol == "WTI" else ("CO" if symbol in ("Brent", "BRN") else None)
+            if not prefix:
+                return []
+            conn = sqlite3.connect(db_path)
+            tables = [t[0] for t in conn.execute(
+                f"SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '{prefix}_%'").fetchall()]
+            months = {'F': 1, 'G': 2, 'H': 3, 'J': 4, 'K': 5, 'M': 6,
+                      'N': 7, 'Q': 8, 'U': 9, 'V': 10, 'X': 11, 'Z': 12}
+
+            def parse_contract(t):
+                suffix = t.split('_')[1]
+                try:
+                    return (int(suffix[1:]), months.get(suffix[0], 99))
+                except Exception:
+                    return (99, 99)
+
+            tables.sort(key=parse_contract)
+            if not tables:
+                conn.close()
+                return []
+
+            _now_ceil = (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+            table_max_ts, global_max = {}, ""
+            for t in tables:
+                row = conn.execute(f"SELECT MAX(timestamp) FROM {t}").fetchone()
+                if row and row[0]:
+                    ts = row[0].replace("T", " ")[:19]
+                    if ts > _now_ceil:
+                        continue  # corrupt far-future timestamp
+                    table_max_ts[t] = row[0]
+                    if row[0] > global_max:
+                        global_max = row[0]
+
+            active_index = 0
+            if global_max:
+                try:
+                    clean_max = global_max.replace("T", " ")[:19]
+                    cutoff_str = (datetime.strptime(clean_max, "%Y-%m-%d %H:%M:%S")
+                                  - timedelta(days=4)).strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    cutoff_str = global_max
+                for i, t in enumerate(tables):
+                    if table_max_ts.get(t, "").replace("T", " ")[:19] >= cutoff_str:
+                        active_index = i
+                        break
+
+            front = tables[active_index]
+            rows = conn.execute(
+                f"SELECT timestamp, open, high, low, close, volume FROM {front} "
+                f"ORDER BY timestamp DESC LIMIT {int(bars)}"
+            ).fetchall()
+            conn.close()
+
+            out = []
+            for r in reversed(rows):
+                try:
+                    out.append({
+                        "timestamp": str(r[0]).replace("T", " ")[:19],
+                        "open": float(r[1]), "high": float(r[2]), "low": float(r[3]),
+                        "close": float(r[4]), "volume": float(r[5]) if r[5] else 0.0,
+                    })
+                except Exception:
+                    continue
+            return out
+        except Exception as e:
+            logger.error(f"Error fetching intraday from 15min DB for {symbol}: {e}")
+            return []
+
+    @staticmethod
     def fetch_historical(symbol: str, period: str = "1mo") -> Optional[List[Dict]]:
         """Fetch historical OHLCV data from database first, then Yahoo Finance with fallback history generation."""
-        if symbol in ["3-2-1CRACK", "CRACK_SPREAD", "GASCRACK", "DIESELCRACK"]:
+        if symbol in ["3-2-1CRACK", "CRACK_SPREAD", "GASCRACK", "DIESELCRACK", "GASOILCRACK"]:
             return PriceFetcher._fetch_crack_spread_historical(symbol, period)
         elif "_CAL_SPREAD" in symbol:
             return PriceFetcher._fetch_cal_spread_historical(symbol, period)
@@ -1254,6 +1354,12 @@ class PriceFetcher:
 
         if symbol == "GO":
             return PriceFetcher.fetch_historical(symbol, period="1wk")
+
+        # WTI/Brent: live 15-min bars from the candle DB (never yfinance).
+        if symbol in ("WTI", "Brent", "BRN"):
+            bars = PriceFetcher._get_intraday_from_15min_db(symbol, bars=max(limit, 180))
+            if bars:
+                return bars[-limit:]
 
         ticker_symbol = PriceFetcher.SYMBOLS.get(symbol)
         if ticker_symbol and USE_YFINANCE and symbol not in ["WTI", "Brent", "BRN"]:

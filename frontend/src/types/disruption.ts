@@ -5,7 +5,7 @@ export type Channel = 'production' | 'transport'
 export type Severity = 'scare' | 'outage' | 'sustained'
 export type ConfidenceBadge = 'HIGH' | 'MEDIUM' | 'LOW' | 'STRUCTURAL'
 export type SourceTag = 'HISTORY' | 'PRIOR' | 'HYBRID'
-export type FeedSourceKey = 'gdelt_db' | 'gdelt_live' | 'eia_rss' | 'cache' | 'empty'
+export type FeedSourceKey = 'acled_db' | 'acled_live' | 'headlines' | 'eia_rss' | 'cache' | 'empty'
 
 export interface ProductExposure {
   wti_pct: number
@@ -151,8 +151,9 @@ export interface NodeRisk {
 
 export interface FeedStatus {
   source: FeedSourceKey
-  gdelt_db_count: number
-  gdelt_reachable: boolean
+  acled_count?: number
+  headline_count?: number
+  acled_total?: number
   last_scrape: string | null
   message: string
 }

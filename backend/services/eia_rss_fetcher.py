@@ -23,6 +23,22 @@ logger = logging.getLogger(__name__)
 EIA_RSS_URL = "https://www.eia.gov/rss/todayinenergy.xml"
 EIA_TIMEOUT = (3.0, 10.0)
 
+_OIL_KEYWORDS = frozenset({
+    "oil", "crude", "petroleum", "opec", "brent", "wti", "nymex",
+    "refin", "tanker", "pipeline", "lng", "gasoline", "diesel",
+    "heating oil", "distillate", "barrel", "barrels", "mb/d",
+    "middle east", "persian gulf", "red sea", "strait", "chokepoint",
+    "saudi", "iran", "iraq", "russia", "venezuela", "nigeria", "libya",
+    "shale", "permian", "offshore", "drill", "upstream", "downstream",
+    "energy market", "fuel", "hydrocarbon", "oil price", "oil output",
+    "oil supply", "oil demand", "oil production", "energy security",
+})
+
+
+def _is_oil_relevant(title: str, desc: str) -> bool:
+    combined = (title + " " + desc).lower()
+    return any(kw in combined for kw in _OIL_KEYWORDS)
+
 
 def _domain(url: str) -> str:
     try:
@@ -54,6 +70,8 @@ def fetch_eia_rss(max_items: int = 20) -> List[Dict]:
             pub   = (item.findtext("pubDate") or "").strip()
             desc  = (item.findtext("description") or "").strip()
             if not title or not link:
+                continue
+            if not _is_oil_relevant(title, desc):
                 continue
             items.append({
                 "url":           link,

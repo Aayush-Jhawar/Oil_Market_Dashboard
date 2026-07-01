@@ -65,6 +65,13 @@ class SpreadCalculator:
             "description": "Diesel Crack",
             "importance": 0.90
         },
+        "GASOILCRACK": {
+            "formula": "GO - Brent",
+            "components": [("GO", 1.0), ("Brent", -1.0)],
+            "unit": "USD/bbl",
+            "description": "Gasoil Crack (ICE gasoil vs Brent — European diesel margin)",
+            "importance": 0.88
+        },
         "FRAC": {
             "formula": "HO/HH ratio",
             "components": [("HO", 1), ("HH", 1)],

@@ -39,6 +39,21 @@ const TIME_RANGES = [
   { label: 'Max', period: 'max' },
 ]
 
+// Rolling indicators (BB/EMA) need a warmup buffer, otherwise a 20-day band only
+// appears at the right edge of a 1-month chart. So we FETCH a longer series than
+// the selected window, compute indicators across the whole thing, then trim to
+// `visibleDays` for display — bands render edge-to-edge. `visibleDays` is trading
+// days (~21/mo). 'max' shows everything.
+const PERIOD_META: Record<string, { fetch: string; visibleDays: number }> = {
+  '1mo': { fetch: '6mo', visibleDays: 23 },
+  '3mo': { fetch: '1y',  visibleDays: 66 },
+  '6mo': { fetch: '2y',  visibleDays: 131 },
+  '1y':  { fetch: '2y',  visibleDays: 262 },
+  '2y':  { fetch: '5y',  visibleDays: 523 },
+  '5y':  { fetch: 'max', visibleDays: 1305 },
+  'max': { fetch: 'max', visibleDays: Number.MAX_SAFE_INTEGER },
+}
+
 // ─── EMA calculation (client-side) ──────────────────────────────────────────
 
 function calcEMA(prices: number[], period: number): (number | null)[] {
@@ -183,8 +198,10 @@ export default function PriceHistoryChart() {
     setError(null)
 
     try {
+      // Fetch a longer window than requested so rolling indicators have warmup.
+      const fetchPeriod = PERIOD_META[period]?.fetch ?? period
       const res = await axios.get(`${API_BASE}/api/prices/${symbol}/historical`, {
-        params: { period },
+        params: { period: fetchPeriod },
         signal: abortRef.current.signal,
         timeout: 30000,
       })
@@ -226,12 +243,13 @@ export default function PriceHistoryChart() {
     fetchHistory(selectedSymbol, selectedPeriod)
   }, [selectedSymbol, selectedPeriod, fetchHistory])
 
-  // Dynamically compute Bollinger Bands client-side when data or BB parameters change
+  // Compute EMA + Bollinger Bands over the FULL fetched series (warmup included),
+  // then trim to the selected visible window so bands are populated edge-to-edge.
   const computedData = useMemo(() => {
     if (!chartData.length) return []
     const prices = chartData.map((d: any) => d.price)
     const bb = calcBollingerBands(prices, bbPeriod, bbMultiplier)
-    return chartData.map((d: any, i: number) => {
+    const full = chartData.map((d: any, i: number) => {
       const lowerVal = bb.lower[i]
       const upperVal = bb.upper[i]
       return {
@@ -244,7 +262,9 @@ export default function PriceHistoryChart() {
         bbRange: lowerVal != null && upperVal != null ? [lowerVal, upperVal] : null,
       }
     })
-  }, [chartData, bbPeriod, bbMultiplier])
+    const visible = PERIOD_META[selectedPeriod]?.visibleDays ?? full.length
+    return full.length > visible ? full.slice(full.length - visible) : full
+  }, [chartData, bbPeriod, bbMultiplier, selectedPeriod])
 
   // Price and BB range metrics
   const firstPrice = computedData[0]?.price

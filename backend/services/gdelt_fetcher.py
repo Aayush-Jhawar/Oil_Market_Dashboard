@@ -141,7 +141,66 @@ def ensure_gdelt_db() -> None:
             value TEXT
         );
     """)
+    # Migration: add classified_at if this is an existing DB without it
+    try:
+        conn.execute("ALTER TABLE articles ADD COLUMN classified_at TEXT")
+        conn.commit()
+        logger.debug("GDELT DB: added classified_at column")
+    except Exception:
+        pass  # column already exists
     conn.close()
+
+
+def get_unclassified_articles(limit: int = 300) -> List[Dict]:
+    """
+    Return up to `limit` articles that haven't been classified yet
+    (classified_at IS NULL), oldest-first so historical backlog drains first.
+    """
+    try:
+        ensure_gdelt_db()
+        conn = sqlite3.connect(f"file:{GDELT_DB_PATH}?mode=ro", uri=True, timeout=5)
+        rows = conn.execute(
+            "SELECT url, title, domain, seendate, language, sourcecountry "
+            "FROM articles "
+            "WHERE classified_at IS NULL "
+            "ORDER BY seendate ASC "
+            "LIMIT ?",
+            (limit,),
+        ).fetchall()
+        conn.close()
+        return [
+            {
+                "url":           r[0],
+                "title":         r[1],
+                "domain":        r[2],
+                "seendate":      r[3],
+                "language":      r[4] or "English",
+                "sourcecountry": r[5] or "",
+                "source":        "GDELT",
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.warning("get_unclassified_articles failed: %s", e)
+        return []
+
+
+def mark_classified(urls: List[str]) -> None:
+    """Mark articles as classified (set classified_at = now)."""
+    if not urls:
+        return
+    try:
+        conn = sqlite3.connect(GDELT_DB_PATH, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        ts = datetime.now(timezone.utc).isoformat()
+        conn.executemany(
+            "UPDATE articles SET classified_at=? WHERE url=?",
+            [(ts, u) for u in urls],
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning("mark_classified failed: %s", e)
 
 
 def _get_state(conn: sqlite3.Connection, key: str, default: Optional[str] = None) -> Optional[str]:

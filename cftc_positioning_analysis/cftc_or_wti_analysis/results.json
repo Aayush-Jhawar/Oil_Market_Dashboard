@@ -1,0 +1,189 @@
+{
+  "window": {
+    "n": 282,
+    "start": "2020-12-21",
+    "end": "2026-05-19",
+    "price_series": "roll-adjusted continuous front-month WTI (NYMEX CL, local 1-min)",
+    "signal": "Other Reportables NET (CFTC Disaggregated, futures-only); OI not in local file -> level + rolling 52w Z"
+  },
+  "extremes": {
+    "ext_long": {
+      "weeks": 8,
+      "episodes": 4
+    },
+    "ext_short": {
+      "weeks": 18,
+      "episodes": 10
+    },
+    "dec_long": {
+      "weeks": 21,
+      "episodes": 7
+    },
+    "dec_short": {
+      "weeks": 77,
+      "episodes": 27
+    }
+  },
+  "forward": [
+    {
+      "bucket": "extreme_long",
+      "horizon_w": 1,
+      "n_weeks": 8,
+      "n_episodes": 4,
+      "mean": 0.036118517390278035,
+      "median": -0.005710187694901836,
+      "std": 0.15301369029597212,
+      "hit_pos": 0.375,
+      "uncond_mean": 0.005435653760780968,
+      "uncond_median": 0.005946746280249382,
+      "diff_vs_uncond": 0.030682863629497067,
+      "hac_se": 0.04812777819516157,
+      "hac_t": 0.6562113679206246,
+      "boot_p": 0.5464,
+      "boot_ci_lo": -0.05566221237619453,
+      "boot_ci_hi": 0.16791120979597438
+    },
+    {
+      "bucket": "extreme_long",
+      "horizon_w": 2,
+      "n_weeks": 8,
+      "n_episodes": 4,
+      "mean": 0.022330233993614168,
+      "median": -0.048017614943121734,
+      "std": 0.21902689724623844,
+      "hit_pos": 0.375,
+      "uncond_mean": 0.011053023609960045,
+      "uncond_median": 0.0136438936393809,
+      "diff_vs_uncond": 0.011277210383654123,
+      "hac_se": 0.07226812846750007,
+      "hac_t": 0.16063641453254957,
+      "boot_p": 0.8824,
+      "boot_ci_lo": -0.13171618101341892,
+      "boot_ci_hi": 0.21257902288552694
+    },
+    {
+      "bucket": "extreme_long",
+      "horizon_w": 4,
+      "n_weeks": 8,
+      "n_episodes": 4,
+      "mean": 0.005968826272963398,
+      "median": -0.060845584132696307,
+      "std": 0.21391630596855837,
+      "hit_pos": 0.125,
+      "uncond_mean": 0.021537950579294595,
+      "uncond_median": 0.0035189448737233953,
+      "diff_vs_uncond": -0.015569124306331197,
+      "hac_se": 0.06528487675910764,
+      "hac_t": -0.24551979336729643,
+      "boot_p": 0.8326,
+      "boot_ci_lo": -0.10586790399925897,
+      "boot_ci_hi": 0.22846927351459256
+    },
+    {
+      "bucket": "extreme_short",
+      "horizon_w": 1,
+      "n_weeks": 18,
+      "n_episodes": 10,
+      "mean": 0.02052821856086312,
+      "median": 0.025296868180433862,
+      "std": 0.03591662853881618,
+      "hit_pos": 0.8333333333333334,
+      "uncond_mean": 0.005435653760780968,
+      "uncond_median": 0.005946746280249382,
+      "diff_vs_uncond": 0.015092564800082153,
+      "hac_se": 0.008147351775683424,
+      "hac_t": 1.9792340440310685,
+      "boot_p": 0.0628,
+      "boot_ci_lo": -0.0015518228334109952,
+      "boot_ci_hi": 0.03037278056318557
+    },
+    {
+      "bucket": "extreme_short",
+      "horizon_w": 2,
+      "n_weeks": 18,
+      "n_episodes": 10,
+      "mean": 0.040394039740583,
+      "median": 0.04942869219353596,
+      "std": 0.05591469759315954,
+      "hit_pos": 0.7777777777777778,
+      "uncond_mean": 0.011053023609960045,
+      "uncond_median": 0.0136438936393809,
+      "diff_vs_uncond": 0.029341016130622954,
+      "hac_se": 0.013861088107309003,
+      "hac_t": 2.2622185855256833,
+      "boot_p": 0.0412,
+      "boot_ci_lo": -0.0004162510904277938,
+      "boot_ci_hi": 0.05524680271398398
+    },
+    {
+      "bucket": "extreme_short",
+      "horizon_w": 4,
+      "n_weeks": 18,
+      "n_episodes": 10,
+      "mean": 0.0412085911787144,
+      "median": 0.058108201711721263,
+      "std": 0.09465093322451879,
+      "hit_pos": 0.6666666666666666,
+      "uncond_mean": 0.021537950579294595,
+      "uncond_median": 0.0035189448737233953,
+      "diff_vs_uncond": 0.019670640599419805,
+      "hac_se": 0.02986896454774704,
+      "hac_t": 0.703982773464241,
+      "boot_p": 0.4788,
+      "boot_ci_lo": -0.04460746861406159,
+      "boot_ci_hi": 0.06708299904693177
+    }
+  ],
+  "uncond": {
+    "1": {
+      "n": 281,
+      "mean": 0.005435653760780968,
+      "median": 0.005946746280249382,
+      "std": 0.055014624739727944,
+      "hit_pos": 0.5516014234875445
+    },
+    "2": {
+      "n": 280,
+      "mean": 0.011053023609960045,
+      "median": 0.0136438936393809,
+      "std": 0.07732371184000246,
+      "hit_pos": 0.5642857142857143
+    },
+    "4": {
+      "n": 279,
+      "mean": 0.021537950579294595,
+      "median": 0.0035189448737233953,
+      "std": 0.10579235605947251,
+      "hit_pos": 0.5161290322580645
+    }
+  },
+  "decay": [
+    {
+      "bucket": "extreme_long",
+      "n": 8,
+      "pre_mean": 0.05748891195661342,
+      "post1_mean": 0.036118517390278035,
+      "pre_median": 0.02737864797399414,
+      "post1_median": -0.005710187694901836,
+      "pre_share_of_move": 0.6141490302395803
+    },
+    {
+      "bucket": "extreme_short",
+      "n": 18,
+      "pre_mean": 0.008700834469293199,
+      "post1_mean": 0.02052821856086312,
+      "pre_median": 0.01772066373593284,
+      "post1_median": 0.025296868180433862,
+      "pre_share_of_move": 0.2976776038661375
+    },
+    {
+      "bucket": "unconditional",
+      "n": 282,
+      "pre_mean": 0.004632112655175464,
+      "post1_mean": 0.005435653760780968,
+      "pre_median": 0.004465453250460216,
+      "post1_median": 0.005946746280249382,
+      "pre_share_of_move": 0.46009337759704233
+    }
+  ]
+}

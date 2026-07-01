@@ -85,6 +85,59 @@ class MacroFetcher:
     """Fetch macro indicators from yfinance (DXY, SPX, TNX, VIX, HH)."""
 
     @staticmethod
+    def _db_latest(indicator_name: str):
+        """(value, change_pct) of the last seeded macro_indicators row, or None.
+
+        Real-data fallback (from Data/macro_daily) for when yfinance is down.
+        """
+        try:
+            from database import SessionLocal
+            from models import MacroIndicator
+            db = SessionLocal()
+            row = (db.query(MacroIndicator)
+                     .filter(MacroIndicator.indicator_name == indicator_name)
+                     .order_by(MacroIndicator.timestamp.desc())
+                     .first())
+            db.close()
+            if row is None or row.value is None:
+                return None
+            return float(row.value), float(row.change_pct or 0.0)
+        except Exception as e:
+            logger.warning(f"Macro DB fallback failed for {indicator_name}: {e}")
+            return None
+
+    @staticmethod
+    def indicator_history(indicator_name: str, days: int = 750):
+        """Daily history for a seeded macro indicator (DXY/TNX/VIX/GOLD).
+
+        From the macro_indicators table (Data/macro_daily). Returns
+        [{date, value, change_pct}] ascending, capped to the last `days`.
+        """
+        try:
+            from database import SessionLocal
+            from models import MacroIndicator
+            db = SessionLocal()
+            rows = (db.query(MacroIndicator)
+                      .filter(MacroIndicator.indicator_name == indicator_name)
+                      .order_by(MacroIndicator.timestamp.desc())
+                      .limit(max(1, days)).all())
+            db.close()
+            if not rows:
+                return None
+            rows = list(reversed(rows))
+            return {
+                "indicator": indicator_name,
+                "history": [{
+                    "date": str(r.timestamp)[:10],
+                    "value": round(float(r.value), 3) if r.value is not None else None,
+                    "change_pct": round(float(r.change_pct), 3) if r.change_pct is not None else None,
+                } for r in rows],
+            }
+        except Exception as e:
+            logger.warning(f"Macro indicator_history failed for {indicator_name}: {e}")
+            return None
+
+    @staticmethod
     def fetch_all_macro() -> Dict:
         """Fetch all macro indicators, using a 5-minute cache."""
         global _MACRO_CACHE, _MACRO_CACHE_TS
@@ -147,6 +200,28 @@ class MacroFetcher:
             "timestamp":     datetime.now().isoformat(),
             "data_source":   "yfinance_live",
         }
+
+        # DB fallback: when yfinance is unavailable, fill blanks with the last
+        # real observed value from the seeded macro_indicators table (Data/
+        # macro_daily). Values there are already in final display units.
+        any_live = any(results.get(k) for k in _MACRO_TICKERS)
+        if not any_live:
+            _DB_FILL = {
+                "dxy":          ("DXY",  "dxy_change"),
+                "us_10y_yield": ("TNX",  "yield_change"),
+                "vix":          ("VIX",  "vix_change"),
+                "gold":         ("GOLD", "gold_change"),
+            }
+            db_used = False
+            for out_key, (indicator, chg_key) in _DB_FILL.items():
+                if macro_data.get(out_key) is None:
+                    row = MacroFetcher._db_latest(indicator)
+                    if row:
+                        macro_data[out_key] = round(row[0], 3)
+                        macro_data[chg_key] = round(row[1], 3)
+                        db_used = True
+            if db_used:
+                macro_data["data_source"] = "db_fallback"
 
         with _MACRO_CACHE_LOCK:
             _MACRO_CACHE = macro_data

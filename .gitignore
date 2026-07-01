@@ -38,6 +38,10 @@ Thumbs.db
 *.db-shm
 *.xlsx
 *.xls
+# Numpy minute-bar caches — local build artifacts. The versioned form is the
+# compact daily parquet (Data/*_front_month.parquet), rebuilt via
+# trump_price_impact.rebuild_daily_parquet().
+*.npz
 
 # Exceptions: small, pre-built slim seed DBs shipped to Hugging Face so the
 # deployed dashboard works without the multi-GB raw data. Built locally by

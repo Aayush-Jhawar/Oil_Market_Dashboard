@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react'
 import axios from 'axios'
 import Card from './shared/Card'
 import CandlestickChart from './shared/CandlestickChart'
+import CurveChartCard from './CurveChartCard'
 import TradingViewWidget from './TradingViewWidget'
 import { useDashboardStore as useLegacyStore } from '../store/useStore'
 
@@ -65,6 +66,7 @@ const SpreadsPanel: React.FC = () => {
     '3-2-1CRACK',
     'GASCRACK',
     'DIESELCRACK',
+    'GASOILCRACK',
     'DUBAI-WTI',
     'FRAC',
   ]
@@ -125,6 +127,7 @@ const SpreadsPanel: React.FC = () => {
               '3-2-1CRACK': 'Formula: ((2 × RBOB + 1 × HO) × 42) - (3 × WTI)',
               'GASCRACK': 'Formula: (RBOB × 42) - WTI',
               'DIESELCRACK': 'Formula: (HO × 42) - WTI',
+              'GASOILCRACK': 'Formula: ICE Gasoil - Brent (European diesel margin)',
               'DUBAI-WTI': 'Formula: Dubai - WTI',
               'FRAC': 'Formula: Natural Gas vs NGLs',
             }
@@ -166,10 +169,10 @@ const SpreadsPanel: React.FC = () => {
         </div>
       </div>
 
-      {/* Candlestick Charts for Crack Spreads and Flys */}
-      <Card title="Crack Spreads & Butterfly Action (1M)">
+      {/* Refining & product cracks (fixed formulas) */}
+      <Card title="Refining & Product Cracks (1M)">
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {['3-2-1CRACK', 'GASCRACK', 'DIESELCRACK', 'FRAC', 'WTI-Brent', 'WTI_CAL_SPREAD', 'BRENT_CAL_SPREAD', 'WTI_FLY', 'BRENT_FLY', 'HO_FLY'].map((symbol) => (
+          {['3-2-1CRACK', 'GASCRACK', 'DIESELCRACK', 'GASOILCRACK', 'FRAC', 'WTI-Brent'].map((symbol) => (
             historicalPrices[symbol] && historicalPrices[symbol].length > 0 && (
               <div key={`candlestick-${symbol}`} className="bg-energy-bg-tertiary p-4 rounded-lg">
                 <h3 className="text-sm font-bold text-slate-300 mb-2">{symbol.replace(/_/g, ' ')}</h3>
@@ -177,6 +180,21 @@ const SpreadsPanel: React.FC = () => {
               </div>
             )
           ))}
+        </div>
+      </Card>
+
+      {/* Interactive calendar spreads & butterflies — pick product + legs in each title */}
+      <Card title="Calendar Spreads & Butterflies — Curve Analysis">
+        <div className="text-xs text-slate-400 mb-4">
+          Select the product and legs in each chart's title — 2 legs = calendar spread, 3 = butterfly. Blue line = live level, dashed = 5-year mean; the z-score is vs the curve's own history.
+        </div>
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <CurveChartCard initialSymbol="WTI" initialLegs={[1, 2]} />
+          <CurveChartCard initialSymbol="Brent" initialLegs={[1, 2]} />
+          <CurveChartCard initialSymbol="WTI" initialLegs={[1, 2, 3]} />
+          <CurveChartCard initialSymbol="Brent" initialLegs={[1, 2, 3]} />
+          <CurveChartCard initialSymbol="HO" initialLegs={[1, 2, 3]} />
+          <CurveChartCard initialSymbol="GO" initialLegs={[1, 2]} />
         </div>
       </Card>
 

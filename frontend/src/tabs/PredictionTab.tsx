@@ -92,7 +92,7 @@ export function PredictionTab() {
     };
 
     const categorySymbols = {
-      Commodity: ['WTI', 'Brent', 'RBOB', 'HO', 'NG'],
+      Commodity: ['WTI', 'Brent', 'RBOB', 'HO', 'GO', 'NG'],
       Crack: ['3-2-1CRACK', 'GASCRACK', 'DIESELCRACK'],
       Spread: ['WTI_CAL_SPREAD', 'WTI-Brent', 'DUB-WTI'],
       Fly: ['RBOB_FLY', 'HO_FLY', ...generateFlies('WTI'), ...generateFlies('BRENT')],

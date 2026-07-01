@@ -1,10 +1,10 @@
 import { useDashboardStore as useLegacyStore } from '../store/useStore'
 import { useDashboardStore as useSnapshotStore } from '../store/dashboardStore'
 import Card from '../components/shared/Card'
-import CandlestickChart from '../components/shared/CandlestickChart'
+import SpotPriceChart from '../components/SpotPriceChart'
 
 export default function PricesTab() {
-  const { prices, historicalPrices } = useLegacyStore()
+  const { prices } = useLegacyStore()
   const snapshot = useSnapshotStore((s) => s.snapshot)
 
   const getSnapshotPrice = (symbol: string) => {
@@ -44,16 +44,14 @@ export default function PricesTab() {
         </div>
       </Card>
 
-      {/* Candlestick Charts for Outrights */}
-      <Card title="Outright Price Action (1M)">
+      {/* Intraday / spot session charts (historical daily lives on the Overview tab) */}
+      <Card title="Spot / Intraday Price Action">
+        <div className="text-xs text-slate-400 mb-4">
+          Live session price action — WTI/Brent from the 15-min candle feed, products from 5-min data. For long-run history &amp; Bollinger/EMA overlays, see the Overview tab.
+        </div>
         <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6">
           {outrightSymbols.map((symbol) => (
-            historicalPrices[symbol] && historicalPrices[symbol].length > 0 ? (
-              <div key={`candlestick-${symbol}`} className="bg-energy-bg-tertiary p-4 rounded-lg">
-                <h3 className="text-sm font-bold text-slate-300 mb-2">{symbol} Price Action</h3>
-                <CandlestickChart data={historicalPrices[symbol]} height={280} />
-              </div>
-            ) : null
+            <SpotPriceChart key={`spot-${symbol}`} symbol={symbol} />
           ))}
         </div>
       </Card>

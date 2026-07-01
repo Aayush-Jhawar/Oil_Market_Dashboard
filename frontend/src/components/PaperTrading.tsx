@@ -247,6 +247,7 @@ export default function PaperTrading() {
             <option value="Brent">Brent</option>
             <option value="HO">HO</option>
             <option value="RBOB">RBOB</option>
+            <option value="GO">Gasoil</option>
             <option value="NG">NG</option>
             <option value="WTI_CAL_SPREAD">WTI Cal Spread</option>
             <option value="BRENT_CAL_SPREAD">Brent Cal Spread</option>

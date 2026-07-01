@@ -4,6 +4,8 @@ import { useDashboardStore } from '../store/useStore'
 import Card from '../components/shared/Card'
 import StormWatch from '../components/StormWatch'
 import TankerWatch from '../components/TankerWatch'
+import InventoryHistoryChart from '../components/InventoryHistoryChart'
+import MacroHistoryChart from '../components/MacroHistoryChart'
 
 interface EIAAnchorRow {
   current_value: number | null
@@ -156,6 +158,11 @@ export default function AnchorDataTab() {
           </div>
         </div>
       </Card>
+
+      <div className="grid gap-6 xl:grid-cols-2 items-start">
+        <InventoryHistoryChart />
+        <MacroHistoryChart />
+      </div>
 
       <Card title="EIA Weekly Anchor Data">
         <div className="text-sm text-slate-400">

@@ -539,6 +539,132 @@ async def _start_background_publishers():
         _trigger_gdelt_scrape, "interval", minutes=2, id="gdelt_scrape",
         next_run_time=datetime.now() + timedelta(seconds=30),
     )
+
+    async def _trigger_impact_maintenance():
+        """Daily: fill null T+1/T+5/T+20 for maturing auto-appended events."""
+        from services.event_impact_db import run_maintenance
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, run_maintenance)
+
+    async def _trigger_impact_backfill():
+        """One-shot at startup: seed event_impact from the catalog + ACLED episodes."""
+        from services.event_impact_db import backfill_catalog, load_unexplained_moves, init_db
+        loop = asyncio.get_running_loop()
+        def _run():
+            init_db()
+            backfill_catalog(force=False)
+            load_unexplained_moves()
+            # Deepen the analog pool with distinct ACLED escalation episodes
+            # (no-op until the ACLED DB has data; idempotent thereafter).
+            try:
+                from services.acled_impact_sourcing import backfill_acled_to_impact
+                backfill_acled_to_impact(dry_run=False)
+            except Exception as _ae:
+                logger.debug("ACLED impact sourcing skipped: %s", _ae)
+        await loop.run_in_executor(None, _run)
+
+    async def _trigger_acled_scrape():
+        """Every 15 min: advance ACLED scraper one country forward + backward."""
+        from services.acled_fetcher import scrape_one_cycle
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, scrape_one_cycle)
+
+    async def _trigger_silent_classify():
+        """
+        Every 30 min: drain unclassified GDELT articles → classify (keyword path,
+        no LLM) → auto-append qualifying events to event_impact DB.
+
+        Uses keyword-only classification to keep cost/latency low at scale.
+        LLM classification remains available only on the user-facing /api/disruption/news.
+        """
+        from services.gdelt_fetcher import (
+            get_unclassified_articles, mark_classified, cluster_articles,
+        )
+        from services.event_impact_db import auto_append_from_classifier
+        import hashlib
+
+        def _run_classify_batch():
+            raw = get_unclassified_articles(limit=300)
+            if not raw:
+                return 0, 0
+
+            # Cluster to deduplicate same-event coverage before classifying
+            clusters = cluster_articles(raw, similarity_threshold=0.30, time_window_hours=48.0)
+
+            # Keyword-only classifier (import _build_keyword_result internals via classify)
+            from services.disruption_classifier import classify_feed_item, _lower, _build_keyword_result
+            from services.eia_event_engine import get_full_impact_matrix
+            matrix = get_full_impact_matrix()
+
+            appended = 0
+            processed_urls = [a["url"] for a in raw]
+
+            for item in clusters:
+                try:
+                    text_lower = _lower(item.get("title", "") + " " + item.get("domain", ""))
+                    cls = _build_keyword_result(text_lower, matrix)
+                except Exception:
+                    continue
+
+                node_id  = cls.get("node_id")
+                severity = cls.get("severity", "scare")
+                if node_id and severity in ("outage", "sustained"):
+                    raw_id = (item.get("url") or item.get("title", ""))[:200]
+                    eid    = "live_" + hashlib.sha1(raw_id.encode()).hexdigest()[:12]
+                    try:
+                        inserted = auto_append_from_classifier(
+                            event_id      = eid,
+                            headline      = item.get("title", ""),
+                            classification = cls,
+                            url           = item.get("url", ""),
+                            source_domain = item.get("domain", ""),
+                            n_sources     = item.get("n_sources", 1),
+                            source_scale  = "national",
+                        )
+                        if inserted:
+                            appended += 1
+                    except Exception:
+                        pass
+
+            mark_classified(processed_urls)
+            return len(raw), appended
+
+        loop = asyncio.get_running_loop()
+        try:
+            n_raw, n_appended = await loop.run_in_executor(None, _run_classify_batch)
+            if n_raw:
+                logger.info(
+                    "Silent classify: processed %d articles → %d events appended to impact DB",
+                    n_raw, n_appended,
+                )
+        except Exception as e:
+            logger.debug("Silent classify error: %s", e)
+
+    # Run the catalog backfill 60 s after startup (after EIA price cache warms)
+    scheduler.add_job(
+        _trigger_impact_backfill, "date",
+        run_date=datetime.now() + timedelta(seconds=60),
+        id="impact_backfill_startup",
+    )
+    # Daily maintenance: fill maturing T+1/T+5/T+20 horizons
+    scheduler.add_job(
+        _trigger_impact_maintenance, "interval", hours=24,
+        id="impact_maintenance",
+        next_run_time=datetime.now() + timedelta(minutes=5),
+    )
+    # Silent classify-and-append: drains unclassified GDELT backlog every 30 min
+    scheduler.add_job(
+        _trigger_silent_classify, "interval", minutes=30,
+        id="silent_classify",
+        next_run_time=datetime.now() + timedelta(minutes=3),
+    )
+    # ACLED: one country per 15-min cycle, forward + 30-day backward pass
+    # 24 countries × 15 min = full rotation every 6 hours; 5-year backfill per country
+    scheduler.add_job(
+        _trigger_acled_scrape, "interval", minutes=15,
+        id="acled_scrape",
+        next_run_time=datetime.now() + timedelta(minutes=7),
+    )
     scheduler.start()
     app.state.scheduler = scheduler
 
@@ -638,6 +764,23 @@ async def websocket_signals_endpoint(websocket: WebSocket):
             await websocket.receive_text()
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket)
+
+
+@app.get("/api/prices/{symbol}/intraday")
+def get_intraday_prices_endpoint(symbol: str, limit: int = 390):
+    """Recent intraday/spot session bars for a symbol. WTI/Brent come from the
+    live 15-min candle DB; RBOB/HO/NG from yfinance 5-min; others fall back to the
+    latest available session. Used by the Prices tab spot chart."""
+    try:
+        data = PriceFetcher.fetch_intraday(symbol, limit=limit)
+        if not data:
+            raise HTTPException(status_code=404, detail=f"No intraday data for {symbol}")
+        return {"status": "success", "data": data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching intraday prices for {symbol}: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
 
 @app.get("/api/prices/{symbol}/historical")
@@ -744,6 +887,47 @@ def get_eia_weekly_anchor():
             status_code=500,
             content={"status": "error", "message": str(e)},
         )
+
+
+@app.get("/api/eia/history")
+def get_eia_history(series: str = "crude"):
+    """Weekly inventory history + 5-year seasonal band for one EIA series.
+
+    Served from the local seeded `inventory` table (Data/eia_*_US.csv), so it
+    needs no API key and covers 2020→present. `series` is one of:
+    crude, cushing, gasoline, distillate, jet, propane, residual, total,
+    refinery_inputs.
+    """
+    try:
+        data = EIAFetcher.inventory_history(series)
+        if not data:
+            return JSONResponse(status_code=404, content={
+                "status": "error",
+                "message": f"no seeded history for series '{series}'",
+                "available": list(EIAFetcher.HISTORY_SERIES.keys()),
+            })
+        return {"status": "success", "data": data, "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error(f"Error fetching EIA history: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.get("/api/macro/history")
+def get_macro_history(indicator: str = "DXY", days: int = 750):
+    """Daily macro history (DXY / TNX / VIX / GOLD) from the seeded
+    macro_indicators table (Data/macro_daily). For overlaying vs oil."""
+    try:
+        data = MacroFetcher.indicator_history(indicator.upper(), days=days)
+        if not data:
+            return JSONResponse(status_code=404, content={
+                "status": "error",
+                "message": f"no seeded history for indicator '{indicator}'",
+                "available": ["DXY", "TNX", "VIX", "GOLD"],
+            })
+        return {"status": "success", "data": data, "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error(f"Error fetching macro history: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
 
 # ==================== RIG COUNT ENDPOINTS ====================
@@ -1744,6 +1928,23 @@ def get_market_structure(symbol: str = 'WTI'):
     except Exception as e:
         return JSONResponse(status_code=500, content={'status': 'error', 'message': str(e)})
 
+@app.get('/api/analytics/curve-structure')
+def get_curve_structure(symbol: str = 'WTI', legs: str = '1,2'):
+    """Custom calendar spread (2 legs) or butterfly (3 legs) for curve analysis.
+    `legs` is a comma list of month indices, e.g. legs=2,5 or legs=2,4,6.
+    Returns the live value plus historical z-score / percentile / series."""
+    try:
+        from services.curve_analytics import get_custom_structure
+        leg_list = [int(x) for x in legs.split(',') if x.strip()]
+        data = get_custom_structure(symbol, leg_list)
+        return {'status': 'success', 'data': data}
+    except ValueError as ve:
+        return JSONResponse(status_code=400, content={'status': 'error', 'message': str(ve)})
+    except Exception as e:
+        logger.error(f"curve-structure error: {e}")
+        return JSONResponse(status_code=500, content={'status': 'error', 'message': str(e)})
+
+
 @app.get('/api/analytics/indicators')
 def get_indicators(symbol: str = 'WTI', period: str = '3mo', ema_periods: str = '20,50', atr_period: int = 14):
     """Return per-symbol indicators: EMA series, ATR series, Bollinger bands, realized vol"""
@@ -2013,94 +2214,263 @@ def get_disruption_catalog():
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
 
+# ── ACLED event → EventCluster converter (used by get_disruption_news) ───────
+
+_ACLED_CONTRACT_MAP = {
+    ("chokepoint",     "transport"):  ("brent_flat",       "Brent Flat"),
+    ("production_hub", "production"): ("brent_flat",       "Brent Flat"),
+    ("production_hub", "transport"):  ("brent_flat",       "Brent Flat"),
+    ("refining_hub",   "production"): ("gasoline_crack",   "Gasoline Crack (RBOB-WTI)"),
+    ("refining_hub",   "transport"):  ("distillate_crack", "Distillate Crack (HO-WTI)"),
+}
+_ACLED_WTI_NODES = {"permian", "usgc_padd3"}
+
+
+def _acled_event_to_cluster(ev: dict) -> dict:
+    """Convert a geo-matched ACLED event to the same shape as an enriched GDELT cluster."""
+    from services.oil_nodes import NODE_BY_ID
+    from services.eia_event_engine import compute_structural_prior
+
+    node_id   = ev.get("matched_node_id", "")
+    node      = NODE_BY_ID.get(node_id, {})
+    node_type = node.get("type") or ev.get("matched_node_type") or "chokepoint"
+
+    event_type_raw = ev.get("event_type") or ""
+    event_lower    = event_type_raw.lower()
+    fatalities     = int(ev.get("fatalities") or 0)
+    if "battle" in event_lower or fatalities > 10:
+        severity = "sustained"
+    elif "explosion" in event_lower or "remote violence" in event_lower:
+        severity = "outage"
+    else:
+        severity = "scare"
+
+    channel = "transport" if node_type == "chokepoint" else "production"
+
+    if node_id in _ACLED_WTI_NODES:
+        most_exp, most_label = "wti_flat", "WTI Flat"
+    else:
+        most_exp, most_label = _ACLED_CONTRACT_MAP.get(
+            (node_type, channel), ("brent_flat", "Brent Flat")
+        )
+
+    prior = compute_structural_prior(node, severity=severity, restored=False, channel=channel)
+
+    dist    = int(ev.get("distance_km") or 0)
+    fat_str = f" {fatalities} fatalities." if fatalities > 0 else ""
+    why     = (
+        f"{event_type_raw} {dist} km from "
+        f"{ev.get('matched_node_name') or node.get('name') or node_id}.{fat_str}"
+    )
+
+    event_date = ev.get("event_date") or ""
+    seendate   = event_date + "T00:00:00+00:00" if event_date and "T" not in event_date else event_date
+
+    return {
+        "url":             f"https://acleddata.com/acled/#{ev.get('event_id', '')}",
+        "title":           f"[ACLED] {event_type_raw}: {ev.get('location', '')}, {ev.get('country', '')}",
+        "domain":          "acleddata.com",
+        "seendate":        seendate,
+        "language":        "English",
+        "sourcecountry":   ev.get("country", ""),
+        "source":          "ACLED",
+        "n_sources":       1,
+        "domains":         ["acleddata.com"],
+        "is_multi_source": False,
+        "actor1":          ev.get("actor1", ""),
+        "fatalities":      fatalities,
+        "classification": {
+            "node_id":               node_id,
+            "node_name":             node.get("name") or ev.get("matched_node_name"),
+            "node_type":             node_type,
+            "channel":               channel,
+            "region":                ev.get("country", ""),
+            "severity":              severity,
+            "restored":              False,
+            "most_exposed_contract": most_exp,
+            "most_exposed_label":    most_label,
+            "confidence":            "STRUCTURAL",
+            "source_tag":            "PRIOR",
+            "reasoning":             (ev.get("notes") or "")[:200],
+            "why_it_matters":        why,
+            "impact": {
+                "wti_pct":   prior.get("wti_pct"),
+                "brent_pct": prior.get("brent_pct"),
+                "arb_usd":   prior.get("arb_usd"),
+                "crack_usd": prior.get("crack_usd"),
+            },
+            "structural_prior": prior,
+            "analogs": [],
+        },
+    }
+
+
 @app.get("/api/disruption/news")
 def get_disruption_news(timespan: str = "3d", total: int = 50):
     """
-    Oil-energy news feed: GDELT (primary) → EIA RSS (fallback), each item
-    pre-classified and clustered into events. Includes ACLED node-risk overlay.
-    Honesty: returns headline + URL only; never stores full paywalled text.
+    Oil-energy disruption feed. ACLED conflict events are the PRIMARY source
+    (GDELT removed — its DOC API was unreliable and rolling-window only). EIA
+    Today-in-Energy RSS is an oil-filtered supplement. Each item carries a
+    classification (node/channel/severity/most-exposed contract/structural prior)
+    and is expandable into a calibrated forecast on the front end.
     """
     try:
-        from services.gdelt_fetcher import (
-            get_stored_feed, get_scrape_status, cluster_articles,
-        )
         from services.disruption_classifier import classify_feed_item
 
-        # ── 1. Source selection ──────────────────────────────────────────────
-        feed_source = "empty"
-        raw_items: list = []
-
-        # a) GDELT local DB (populated by background scraper)
-        stored = get_stored_feed(timespan=timespan, total=total * 3)
-        if stored:
-            raw_items   = cluster_articles(stored)[:total]
-            feed_source = "gdelt_db"
-        else:
-            # b) GDELT live API (quick single-query attempt with short timeout)
-            try:
-                from services.gdelt_fetcher import fetch_gdelt_articles
-                live = fetch_gdelt_articles(timespan=timespan, max_records=total, query_idx=0)
-                if live:
-                    raw_items   = cluster_articles(live)[:total]
-                    feed_source = "gdelt_live"
-            except Exception:
-                pass
-
-        # c) EIA Today in Energy RSS (fallback — works when GDELT is blocked)
-        if not raw_items:
-            try:
-                from services.eia_rss_fetcher import fetch_eia_rss
-                raw_items   = fetch_eia_rss(max_items=total)
-                feed_source = "eia_rss" if raw_items else "empty"
-            except Exception:
-                pass
-
-        # ── 2. Classify each item ────────────────────────────────────────────
-        enriched = []
-        for item in raw_items:
-            cls = {}
-            try:
-                cls = classify_feed_item(item)
-            except Exception:
-                pass
-            enriched.append({**item, "classification": cls or {}})
-
-        # ── 3. ACLED node-risk overlay ───────────────────────────────────────
+        # ── 1. ACLED — primary source ────────────────────────────────────────
         acled_events: list = []
         node_risks: dict   = {}
+        acled_clusters: list = []
         try:
             from services.acled_fetcher import get_acled_events, get_node_risk_overlay
             acled_events = get_acled_events(days=30)
             node_risks   = get_node_risk_overlay(acled_events)
-        except Exception as e:
-            logger.debug("ACLED overlay skipped: %s", e)
+            for ev in acled_events[:60]:
+                try:
+                    acled_clusters.append(_acled_event_to_cluster(ev))
+                except Exception as _ce:
+                    logger.debug("ACLED cluster conversion failed: %s", _ce)
 
-        # ── 4. Feed status metadata for frontend ─────────────────────────────
+            # Dedup: one item per (node_id, date) — keep worst severity
+            _SEV_RANK = {"sustained": 3, "outage": 2, "scare": 1}
+            _acled_by_key: dict = {}
+            for _c in acled_clusters:
+                _cls = _c.get("classification") or {}
+                _key = (_cls.get("node_id", ""), (_c.get("seendate") or "")[:10])
+                _ex  = _acled_by_key.get(_key)
+                if not _ex:
+                    _acled_by_key[_key] = _c
+                else:
+                    _ex_sev  = _SEV_RANK.get((_ex.get("classification") or {}).get("severity", "scare"), 1)
+                    _new_sev = _SEV_RANK.get(_cls.get("severity", "scare"), 1)
+                    if _new_sev > _ex_sev or (
+                        _new_sev == _ex_sev and _c.get("fatalities", 0) > _ex.get("fatalities", 0)
+                    ):
+                        _acled_by_key[_key] = _c
+            acled_clusters = sorted(
+                _acled_by_key.values(),
+                key=lambda x: x.get("seendate", ""), reverse=True,
+            )
+        except Exception as e:
+            logger.debug("ACLED fetch skipped: %s", e)
+
+        feed_source = "acled_db" if acled_clusters else "empty"
+
+        # ── 2. Live financial headlines (FinancialJuice / OilPrice / Reuters /
+        #       Trump) — the GDELT replacement layer. Classify each so market-
+        #       moving items (Iran, Hormuz, OPEC) land on a node + get a forecast.
+        live_items: list = []
+        headline_n = 0
+        try:
+            from services.headline_sources import fetch_headlines
+            for item in fetch_headlines(max_per_source=12):
+                cls = {}
+                try:
+                    cls = classify_feed_item(item)
+                except Exception:
+                    pass
+                live_items.append({**item, "classification": cls or {}})
+                headline_n += 1
+        except Exception as _he:
+            logger.debug("headline sources skipped: %s", _he)
+
+        # ── 3. EIA RSS — oil-filtered supplement ─────────────────────────────
+        eia_n = 0
+        try:
+            from services.eia_rss_fetcher import fetch_eia_rss
+            for item in fetch_eia_rss(max_items=15):
+                cls = {}
+                try:
+                    cls = classify_feed_item(item)
+                except Exception:
+                    pass
+                live_items.append({**item, "classification": cls or {}})
+                eia_n += 1
+        except Exception:
+            pass
+
+        if acled_clusters and (headline_n or eia_n):
+            feed_source = "acled_live"
+        elif headline_n or eia_n:
+            feed_source = "headlines"
+
+        # Compose: NEWEST FIRST across everything. Live headlines (current) lead;
+        # the mid-2025 ACLED data sinks to where its date falls. Reserve up to a
+        # quarter of the slots for ACLED so the forecast-capable conflict cards
+        # survive the slice, then sort the whole set newest-first for display.
+        live_items.sort(key=lambda x: x.get("seendate", ""), reverse=True)
+        reserve  = min(len(acled_clusters), max(0, total // 4))
+        combined = list(acled_clusters[:reserve]) + live_items[:max(0, total - reserve)]
+        combined.sort(key=lambda x: x.get("seendate", ""), reverse=True)
+        enriched = combined[:total]
+
+        # ── 3. Feed status metadata ──────────────────────────────────────────
         scrape_status = {}
         try:
+            from services.acled_fetcher import get_scrape_status
             scrape_status = get_scrape_status()
         except Exception:
             pass
 
         source_labels = {
-            "gdelt_db":   "GDELT database (scraped)",
-            "gdelt_live": "GDELT live API",
-            "eia_rss":    "EIA Today in Energy RSS (GDELT unavailable from this network)",
-            "empty":      "No feed available — GDELT unreachable and EIA RSS empty",
+            "acled_db":   "ACLED conflict database",
+            "acled_live": "ACLED + live headlines (FinancialJuice · OilPrice · Reuters · Trump)",
+            "headlines":  "Live headlines (FinancialJuice · OilPrice · Reuters · Trump · EIA)",
+            "eia_rss":    "EIA Today in Energy RSS",
+            "empty":      "No feed available",
         }
         feed_status = {
-            "source":          feed_source,
-            "gdelt_db_count":  scrape_status.get("total_articles", 0),
-            "gdelt_reachable": feed_source in ("gdelt_db", "gdelt_live"),
-            "last_scrape":     scrape_status.get("latest_fetched"),
-            "message":         f"{len(enriched)} items · {source_labels.get(feed_source, feed_source)}",
+            "source":        feed_source,
+            "acled_count":   len(acled_clusters),
+            "headline_count": headline_n,
+            "acled_total":   scrape_status.get("total_articles", 0),
+            "last_scrape":   scrape_status.get("latest_fetched"),
+            "message":       f"{len(enriched)} items · {source_labels.get(feed_source, feed_source)}",
         }
+
+        # ── 4. Per-node live signal — fold the CURRENT feed onto the 15 nodes ──
+        # Each node gets: how many current items mention it, the latest headline,
+        # the worst severity seen, and the expected move (mean of classified
+        # impacts). This is what drives the "updated by news" node grid.
+        _SEV_RANK = {"sustained": 3, "outage": 2, "scare": 1}
+        node_signals: dict = {}
+        for _item in enriched:
+            _cls = _item.get("classification") or {}
+            _nid = _cls.get("node_id")
+            if not _nid:
+                continue
+            _sig = node_signals.setdefault(_nid, {
+                "node_id": _nid, "news_count": 0, "latest_headline": None,
+                "latest_date": "", "worst_severity": None, "most_exposed_label": None,
+                "_wti": [], "_brent": [], "_crack": [],
+            })
+            _sig["news_count"] += 1
+            _sd = _item.get("seendate") or ""
+            if _sd > _sig["latest_date"]:
+                _sig["latest_date"] = _sd
+                _sig["latest_headline"] = (_item.get("title") or "")[:140]
+                _sig["most_exposed_label"] = _cls.get("most_exposed_label")
+            _sev = _cls.get("severity")
+            if _sev and (_sig["worst_severity"] is None or
+                         _SEV_RANK.get(_sev, 0) > _SEV_RANK.get(_sig["worst_severity"], 0)):
+                _sig["worst_severity"] = _sev
+            _imp = _cls.get("impact") or {}
+            if _imp.get("wti_pct")   is not None: _sig["_wti"].append(_imp["wti_pct"])
+            if _imp.get("brent_pct") is not None: _sig["_brent"].append(_imp["brent_pct"])
+            if _imp.get("crack_usd") is not None: _sig["_crack"].append(_imp["crack_usd"])
+        for _sig in node_signals.values():
+            _sig["exp_wti_pct"]   = round(sum(_sig["_wti"]) / len(_sig["_wti"]), 2) if _sig["_wti"] else None
+            _sig["exp_brent_pct"] = round(sum(_sig["_brent"]) / len(_sig["_brent"]), 2) if _sig["_brent"] else None
+            _sig["exp_crack_usd"] = round(sum(_sig["_crack"]) / len(_sig["_crack"]), 2) if _sig["_crack"] else None
+            for _k in ("_wti", "_brent", "_crack"):
+                _sig.pop(_k, None)
 
         return {
             "status":       "success",
             "data":         enriched,
             "acled_events": acled_events[:50],
             "node_risks":   node_risks,
+            "node_signals": node_signals,
             "feed_status":  feed_status,
             "count":        len(enriched),
             "timestamp":    datetime.now().isoformat(),
@@ -2114,15 +2484,47 @@ def get_disruption_news(timespan: str = "3d", total: int = 50):
 def get_disruption_status():
     """Scrape health + DB stats for the news feed monitor."""
     try:
-        from services.gdelt_fetcher import get_scrape_status
-        scrape = get_scrape_status()
+        from services.gdelt_fetcher import get_scrape_status as gdelt_status
+        from services.acled_fetcher import get_scrape_status as acled_status
+        gdelt  = gdelt_status()
+        acled  = acled_status()
         acled_avail = bool(
-            __import__("os").getenv("ACLED_KEY") and __import__("os").getenv("ACLED_EMAIL")
+            __import__("os").getenv("ACLED_EMAIL") and __import__("os").getenv("ACLED_PASSWORD")
         )
+        # GDELT classified/unclassified counts
+        unclassified_count = 0
+        try:
+            import sqlite3 as _sq
+            from services.gdelt_fetcher import GDELT_DB_PATH
+            _c = _sq.connect(f"file:{GDELT_DB_PATH}?mode=ro", uri=True, timeout=3)
+            unclassified_count = _c.execute(
+                "SELECT COUNT(*) FROM articles WHERE classified_at IS NULL"
+            ).fetchone()[0]
+            _c.close()
+        except Exception:
+            pass
+        impact_stats = {}
+        try:
+            from services.event_impact_db import get_db_stats
+            impact_stats = get_db_stats()
+        except Exception:
+            pass
         return {
-            "status":  "success",
-            "gdelt":   scrape,
-            "acled_available": acled_avail,
+            "status":       "success",
+            "gdelt":        gdelt,
+            "acled":        {**acled, "available": acled_avail},
+            "dataset": {
+                "gdelt_total_scraped":  gdelt.get("total_articles", 0),
+                "gdelt_unclassified":   unclassified_count,
+                "gdelt_classified":     gdelt.get("total_articles", 0) - unclassified_count,
+                "acled_total_events":   acled.get("total_events", 0),
+                "acled_countries":      acled.get("countries", 0),
+                "acled_oldest":         acled.get("oldest_event"),
+                "impact_events":        impact_stats.get("total_events", 0),
+                "fired_events":         impact_stats.get("fired", 0),
+                "pending_outcomes":     impact_stats.get("pending_outcomes", 0),
+                "unexplained_moves":    impact_stats.get("unexplained_moves", 0),
+            },
             "timestamp": datetime.now().isoformat(),
         }
     except Exception as e:
@@ -2145,6 +2547,342 @@ async def classify_disruption_text(payload: dict):
         return {"status": "success", "data": result, "timestamp": datetime.now().isoformat()}
     except Exception as e:
         logger.error(f"Classify error: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+# ==================== EVENT IMPACT TABLE ENDPOINTS ====================
+
+@app.get("/api/disruption/impact/events")
+def get_impact_events(
+    node_id: str = None,
+    basin: str = None,
+    only_fired: bool = False,
+    include_null: bool = True,
+    limit: int = 200,
+):
+    """
+    All rows in the event_impact table, newest first.
+    source_tag='history'  → EIA-measured returns exist.
+    source_tag='prior'    → structural prior only; T cols may be null.
+    magnitude_class='none' → event did not clear the surge/crash threshold
+                             (these ARE the null-event negative class).
+    """
+    try:
+        from services.event_impact_db import get_all_events
+        data = get_all_events(
+            node_id=node_id,
+            basin=basin,
+            only_fired=only_fired,
+            include_null_events=include_null,
+            limit=limit,
+        )
+        return {
+            "status":    "success",
+            "data":      data,
+            "count":     len(data),
+            "timestamp": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        logger.error("impact/events error: %s", e)
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.get("/api/disruption/impact/base-rates")
+def get_base_rates(group_by: str = "node_id", min_n: int = 1):
+    """
+    Step 5 base-rate view grouped by (node_id|basin, channel, severity, anticipated).
+
+    Returns for each group:
+      median & IQR move per contract per horizon (T+0, T+1, T+5)
+      hit_rate  = n_fired / n_measured  (measured rows only)
+      false_positive_rate = unexplained_moves / all_threshold_moves
+      n_measured vs n_modeled (shown separately, never mixed)
+      products_modeled flag for Asia/MiddleEast/Russia crack+arb cells
+
+    Honesty: API never returns a single predicted price — always a distribution.
+    Modeled cells (crack/arb for non-Atlantic basins) are marked and excluded
+    from measured base rates.
+    """
+    try:
+        from services.base_rates import compute_base_rates
+        if group_by not in ("node_id", "basin"):
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "group_by must be 'node_id' or 'basin'"},
+            )
+        data = compute_base_rates(group_by=group_by, min_n=min_n)
+        return {
+            "status":    "success",
+            "data":      data,
+            "count":     len(data),
+            "group_by":  group_by,
+            "note": (
+                "hit_rate is computed on source_tag='history' rows only. "
+                "products_modeled=true means crack/arb cells use HO-WTI proxy "
+                "and are excluded from the measured base rate."
+            ),
+            "timestamp": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        logger.error("base-rates error: %s", e)
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.post("/api/disruption/impact/backfill")
+def trigger_backfill(force: bool = False):
+    """
+    Admin: re-run the catalog backfill.
+    force=true overwrites existing rows (use when EIA price cache is refreshed).
+    Returns: {inserted, null_events, no_price, errors}.
+
+    Backfill rules:
+    - event_date alignment: T-1 = last close BEFORE event, T+0 = ON/AFTER
+    - point-in-time EIA prices only (no revised series)
+    - T+20 stored but excluded from fired/magnitude_class
+    - Wrong-direction moves → fired=False, LOW confidence, confound_note set
+    - Anticipated events (OPEC) get anticipated=1 for separate base-rate bucket
+    """
+    try:
+        from services.event_impact_db import backfill_catalog, load_unexplained_moves, init_db
+        init_db()
+        counts       = backfill_catalog(force=force)
+        unexplained  = load_unexplained_moves()
+        acled = {}
+        try:
+            from services.acled_impact_sourcing import backfill_acled_to_impact
+            acled = backfill_acled_to_impact(dry_run=False).get("counts", {})
+        except Exception as _ae:
+            logger.debug("ACLED impact sourcing skipped: %s", _ae)
+        return {
+            "status":             "success",
+            "backfill":           counts,
+            "acled_episodes":     acled,
+            "unexplained_moves":  unexplained,
+            "timestamp":          datetime.now().isoformat(),
+        }
+    except Exception as e:
+        logger.error("backfill error: %s", e)
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.get("/api/disruption/impact/status")
+def get_impact_status():
+    """
+    DB health: row counts, pending outcomes, unexplained-move count.
+    Use to verify the gate is working (null_events should be > 0,
+    pending_outcomes fills as maintenance job runs).
+    """
+    try:
+        from services.event_impact_db import get_db_stats
+        stats = get_db_stats()
+        return {"status": "success", "data": stats, "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.get("/api/disruption/coverage")
+def get_coverage_table():
+    """
+    Stage 1a coverage audit. For every catalogued event and every node, document
+    whether ACLED can structurally source it (conflict event + region covered on
+    the event date + scraped event type + node match) or whether it must come
+    from the curated catalog / structural prior.
+
+    Surfaces the holes BEFORE they become silently-empty queries:
+      - non-conflict events ACLED can never see (weather/accident/strike/cyber/
+        sanction/OPEC decision),
+      - regional coverage gaps (US/North-Sea pre-2020, Middle-East pre-2016),
+      - the pre-2006 EIA price boundary (Katrina/Rita have no measured reaction).
+
+    ACLED coverage-start dates are ACLED's published regional windows and are
+    flagged to_confirm against the current ACLED coverage documentation.
+    """
+    try:
+        from services.coverage_table import build_coverage_table, node_coverage_matrix
+        table = build_coverage_table()
+        return {
+            "status":        "success",
+            "events":        table["rows"],
+            "summary":       table["summary"],
+            "node_matrix":   node_coverage_matrix(),
+            "count":         len(table["rows"]),
+            "timestamp":     datetime.now().isoformat(),
+        }
+    except Exception as e:
+        logger.error("coverage table error: %s", e)
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.get("/api/disruption/calibration")
+def get_calibration():
+    """
+    Stage 2 walk-forward calibration harness. For every measured event, predicts
+    its forward move from ONLY prior data and checks whether realized T+1/T+5/T+20
+    fell inside the 50% / 80% bands. Zero look-ahead (priors are strictly earlier
+    events; vol windows end the day before the event).
+
+    Scores two baselines side by side:
+      - base_rate  : empirical bands from prior same-bucket events (abstains <2 priors)
+      - struct_vol : structural prior centre + point-in-time vol band width
+
+    Returns per-predictor coverage table (nominal 50/80 vs empirical) and a PIT
+    histogram (uniform = calibrated). These are the benchmarks Stage 3's analog
+    retrieval and Stage 4's Monte-Carlo predictor must beat.
+    """
+    try:
+        from services.calibration_harness import (
+            run_harness, predict_base_rate, predict_struct_vol,
+        )
+        # analog + montecarlo live in modules that import the harness, so register
+        # them here (lazy) to avoid an import cycle. This gives the full four-way
+        # progression over HTTP, not just the two baselines.
+        predictors = {
+            "base_rate":  predict_base_rate,
+            "struct_vol": predict_struct_vol,
+        }
+        try:
+            from services.analog_retrieval import predict_analog
+            predictors["analog"] = predict_analog
+        except Exception:
+            pass
+        try:
+            from services.move_predictor import predict_montecarlo
+            predictors["montecarlo"] = predict_montecarlo
+        except Exception:
+            pass
+        return {
+            "status":    "success",
+            "data":      run_harness(predictors=predictors),
+            "note": (
+                "Calibration improves down the stack: base_rate → struct_vol → "
+                "analog → montecarlo. Under-coverage means bands too narrow; the "
+                "MC jump term supplies the missing width. uniform_deviation: "
+                "0=calibrated, ~0.5=worst."
+            ),
+            "timestamp": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        logger.error("calibration harness error: %s", e)
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.get("/api/disruption/analog")
+def get_analog(node_id: str, channel: str = "transport",
+               severity: str = "outage", restored: bool = False,
+               k: int = 6):
+    """
+    Stage 3 direction-gated analog retrieval. For a hypothetical new event
+    (node_id + channel + severity), retrieve the most analogous prior events and
+    read the per-product impact direction off the neighbourhood.
+
+    Returns the similarity-weighted per-contract median + sign-consistency, the
+    most-hit / most-benefited contracts, and the 3-4 driving analogs. The
+    direction gate refuses to cross sign_class (escalation vs restored). If the
+    best neighbour is below the similarity floor, confidence drops to STRUCTURAL.
+
+    Weights are tuned against the Stage-2 harness; arb/crack cells outside the
+    Atlantic basin are tagged modeled and excluded from the measured read.
+    """
+    try:
+        from services.analog_retrieval import retrieve_for_query
+        query = {"node_id": node_id, "channel": channel,
+                 "severity": severity, "restored": restored}
+        data = retrieve_for_query(query, k=k)
+        return {"status": "success", "data": data,
+                "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error("analog retrieval error: %s", e)
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.get("/api/disruption/walkforward")
+def get_walkforward(start_date: str = "2021-01-01", n_paths: int = 2500):
+    """
+    Walk-forward back-test of grouped ACLED escalation episodes vs realized crude
+    (WTI) and distillate-crack moves. Each episode from `start_date` is predicted
+    using ONLY prior data (catalog + earlier ACLED episodes) — zero look-ahead —
+    and the prediction's 80%/50% bands and direction are scored against what the
+    contracts actually did at T+1/T+5.
+
+    This is the empirical proof the grouped-event predictor brackets reality.
+    Distillate crack is measured only in Atlantic-basin episodes (Dubai/gasoil
+    are modeled elsewhere), so its n is smaller than crude's.
+    """
+    try:
+        from services.walkforward_acled import walk_forward
+        return {"status": "success", "data": walk_forward(start_date=start_date, n_paths=n_paths),
+                "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error("walkforward error: %s", e)
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.get("/api/disruption/trump")
+def get_trump(limit: int = 30):
+    """
+    Trump-post → WTI price-impact panel. Returns the TRAINED model (how the
+    front-month WTI moved after his oil-relevant posts, overall and per topic,
+    measured on 1-minute CL data 2021→2026) plus the most recent posts with their
+    topic and the model's predicted intraday move.
+
+    The per-topic median/IQR/P(up) is a base rate, not a price target.
+    """
+    try:
+        from services.trump_price_impact import run_study
+        s = run_study(oil_only=True)
+        recent = []
+        for p in reversed(s["posts"][-limit:]):
+            recent.append({
+                "status_id": p["status_id"], "created_utc": p["created_utc"],
+                "topic": p["topic"], "stance": p["stance"], "text": p["text"],
+                "realized": p["moves"],
+                "predicted_stance": s["by_stance"].get(p["stance"], {}),
+            })
+        return {
+            "status": "success",
+            "model": {
+                "n_posts_scored": s["n_posts_scored"],
+                "products":       s["products"],
+                "product_labels": s["product_labels"],
+                "horizons":       s["horizons"],
+                "overall":        s["overall"],
+                "by_stance":      s["by_stance"],
+                "by_topic":       s["by_topic"],
+            },
+            "recent": recent,
+            "timestamp": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        logger.error("trump impact error: %s", e)
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+@app.get("/api/disruption/forecast")
+def get_forecast(node_id: str, channel: str = "transport",
+                 severity: str = "outage", restored: bool = False,
+                 n_paths: int = 3000, k: int = 6):
+    """
+    Stage 4 jump-diffusion Monte-Carlo forward distribution for a hypothetical new
+    event. Combines a news jump (block-bootstrapped from the Stage-3 analog
+    neighbourhood, severity-scaled) with baseline diffusion (2-regime GMM on the
+    contract's own point-in-time return history).
+
+    Returns per-contract percentile bands at T+1/5/20, P(up), expected move,
+    P(touch ±5%/$5), the driving analogs, and a confidence badge. Zero/weak
+    neighbourhoods fall back to a labelled structural-prior distribution.
+
+    This is a calibrated scenario distribution, never a deterministic price
+    forecast. Validated on the Stage-2 harness (50/80% bands cover at target).
+    """
+    try:
+        from services.move_predictor import forward_distribution
+        query = {"node_id": node_id, "channel": channel,
+                 "severity": severity, "restored": restored}
+        data = forward_distribution(query, n_paths=n_paths, k=k)
+        return {"status": "success", "data": data,
+                "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error("forecast error: %s", e)
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
 

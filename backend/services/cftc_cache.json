@@ -1,26 +1,26 @@
 {
   "WTI": {
-    "mm_net_long": -23666,
-    "mm_net_change": 3902,
-    "producer_net_short": -71023,
-    "open_interest": 822990,
+    "mm_net_long": -18387,
+    "mm_net_change": 5279,
+    "producer_net_short": -66519,
+    "open_interest": 803067,
     "data_source": "cftc_live",
-    "timestamp": "2026-06-25T08:39:59.773302"
+    "timestamp": "2026-07-01T03:45:56.785088"
   },
   "RBOB": {
-    "mm_net_long": 67420,
-    "mm_net_change": 3295,
-    "producer_net_short": 85572,
-    "open_interest": 310469,
+    "mm_net_long": 71095,
+    "mm_net_change": 3675,
+    "producer_net_short": 86498,
+    "open_interest": 316160,
     "data_source": "cftc_live",
-    "timestamp": "2026-06-25T08:39:59.781641"
+    "timestamp": "2026-07-01T03:45:56.796735"
   },
   "HO": {
-    "mm_net_long": 9519,
-    "mm_net_change": 12,
-    "producer_net_short": 63414,
-    "open_interest": 271983,
+    "mm_net_long": 6408,
+    "mm_net_change": -3111,
+    "producer_net_short": 60005,
+    "open_interest": 270034,
     "data_source": "cftc_live",
-    "timestamp": "2026-06-25T08:39:59.789894"
+    "timestamp": "2026-07-01T03:45:56.809760"
   }
 }

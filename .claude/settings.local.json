@@ -2,7 +2,18 @@
   "permissions": {
     "allow": [
       "Bash",
-      "PowerShell"
+      "PowerShell",
+      "Skill(deep-research)",
+      "Skill(deep-research:*)",
+      "Bash(python comparison.py)",
+      "Bash(python -c 'import ast *)",
+      "Bash(python -c ' *)",
+      "Bash(python scripts/backfill_eia_history.py)",
+      "Bash(python scripts/backfill_macro_history.py)",
+      "Bash(python -m py_compile services/eia_fetcher.py services/macro_fetcher.py scripts/backfill_ohlcv_history.py scripts/backfill_eia_history.py scripts/backfill_macro_history.py)",
+      "WebFetch(domain:robomacro.com)",
+      "Bash(python -)",
+      "Bash(git add *)"
     ],
     "deny": []
   }

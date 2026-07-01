@@ -1,18 +1,18 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import axios from 'axios'
 import type {
   OilNodeSummary,
   OilNodeDetail,
   EventCluster,
-  AcledEvent,
   NodeRisk,
   FeedStatus,
-  ClassificationResult,
   ConfidenceBadge,
   NodeType,
   Channel,
   Severity,
 } from '../types/disruption'
+import { useForecast, ForecastBands, ModelAccuracy } from '../components/DisruptionForecast'
+import { TrumpImpactPanel } from '../components/TrumpImpact'
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 const api = axios.create({ baseURL: API_BASE, timeout: 30000 })
@@ -71,10 +71,18 @@ const channelBg: Record<Channel, string> = {
   production: 'bg-emerald-900 text-emerald-300',
   transport:  'bg-cyan-900 text-cyan-300',
 }
+// trusted financial/energy wires (via Google-News, publisher-filtered) share a tone
+const WIRE = 'bg-sky-950 text-sky-300'
 const sourceBg: Record<string, string> = {
-  GDELT:   'bg-blue-950 text-blue-400',
-  EIA_RSS: 'bg-teal-950 text-teal-300',
-  ACLED:   'bg-red-950 text-red-400',
+  EIA_RSS:        'bg-teal-950 text-teal-300',
+  ACLED:          'bg-red-950 text-red-400',
+  FinancialJuice: 'bg-indigo-950 text-indigo-300',
+  OilPrice:       'bg-amber-950 text-amber-300',
+  Trump:          'bg-orange-950 text-orange-300',
+  Reuters: WIRE, WSJ: WIRE, Bloomberg: WIRE, NYT: WIRE, CNBC: WIRE, Fortune: WIRE,
+  MarketWatch: WIRE, 'S&P Global': WIRE, Rigzone: WIRE, StoneX: WIRE, ING: WIRE,
+  FT: WIRE, 'The Economist': WIRE, 'Business Insider': WIRE, 'Yahoo Finance': WIRE,
+  'CBS News': WIRE, CNN: WIRE, Reuters_Wire: WIRE, Wire: WIRE,
 }
 const acledRiskRing: Record<string, string> = {
   HIGH:   'ring-2 ring-red-500',
@@ -159,16 +167,22 @@ function ImpactRow({
 // ── Event card ────────────────────────────────────────────────────────────────
 
 function EventCard({
-  item, isExpanded, onToggle, onClassify,
+  item, isExpanded, onToggle,
 }: {
   item: EventCluster
   isExpanded: boolean
   onToggle: () => void
-  onClassify: (r: ClassificationResult) => void
 }) {
   const cls      = item.classification
   const nodeType = cls?.node_type
   const nSrc     = item.n_sources ?? 1
+
+  // When expanded and the item classifies to a node, fetch its live calibrated
+  // forecast directly — no manual paste step. Idle (null) until expanded.
+  const fcQuery = isExpanded && cls?.node_id && cls?.channel && cls?.severity
+    ? { node_id: cls.node_id, channel: cls.channel, severity: cls.severity, restored: !!cls.restored }
+    : null
+  const { fc, loading: fcLoading, err: fcErr } = useForecast(fcQuery)
 
   // Border: ACLED events use red; others use node-type color
   const borderColor = item.source === 'ACLED'
@@ -280,91 +294,59 @@ function EventCard({
         </div>
       )}
 
-      {/* Expanded: per-contract impact */}
+      {/* Expanded: live calibrated forecast for this event's node/channel/severity */}
       {isExpanded && cls && (
         <div
           className="mt-2.5 pt-2 border-t border-slate-700"
           onClick={(e) => e.stopPropagation()}
         >
-          <div className="flex items-center gap-2 mb-1.5 text-xs">
+          <div className="flex items-center gap-2 mb-2 text-xs">
             <span className="text-slate-400">Most exposed:</span>
             <span className="text-yellow-300 font-semibold">{cls.most_exposed_label}</span>
-            <span
-              className="text-slate-600"
-              title="HISTORY = mean of historical analog events. PRIOR = structural model (direction × elasticity × criticality)."
-            >
-              [{cls.source_tag}]
-            </span>
           </div>
-          <div className="grid grid-cols-4 gap-1.5 mb-2">
-            {[
-              { label: 'WTI', value: cls.impact.wti_pct, fmt: fmt_pct,    tip: 'West Texas Intermediate. US domestic crude benchmark ($/bbl).' },
-              { label: 'Brent', value: cls.impact.brent_pct, fmt: fmt_pct, tip: 'ICE Brent. Global seaborne crude benchmark ($/bbl).' },
-              { label: 'Arb', value: cls.impact.arb_usd, fmt: fmt_dollar,  tip: 'Brent-WTI spread change ($/bbl). Positive = Brent rises relative to WTI.' },
-              { label: 'Crack', value: cls.impact.crack_usd, fmt: fmt_dollar, tip: 'Distillate crack = HO $/gal × 42 − WTI. Proxy for refinery margin ($/bbl).' },
-            ].map(({ label, value, fmt, tip }) => (
-              <div key={label} className="bg-slate-800 rounded p-1.5 text-center" title={tip}>
-                <div className="text-slate-500 text-xs mb-0.5">{label}</div>
-                <div className={`font-mono font-bold text-sm ${
-                  value == null ? 'text-slate-600'
-                    : value > 0 ? 'text-emerald-400'
-                    : 'text-red-400'
-                }`}>
-                  {fmt(value)}
-                </div>
-              </div>
-            ))}
-          </div>
-          <div className="text-xs text-slate-600 italic">{cls.reasoning}</div>
-          <button
-            className="mt-2 text-xs text-blue-400 hover:text-blue-300"
-            onClick={() => cls && onClassify(cls)}
-          >
-            Open in classifier →
-          </button>
+
+          {cls.node_id ? (
+            fcLoading ? (
+              <div className="text-xs text-blue-400 animate-pulse">Simulating forecast paths…</div>
+            ) : fcErr ? (
+              <div className="text-xs text-rose-400">Forecast unavailable: {fcErr}</div>
+            ) : fc ? (
+              <ForecastBands forecast={fc} compact />
+            ) : (
+              <div className="text-xs text-slate-500">No forecast available.</div>
+            )
+          ) : (
+            <div className="text-xs text-slate-500 italic">
+              No node match — structural prior only. {cls.reasoning}
+            </div>
+          )}
         </div>
       )}
     </div>
   )
 }
 
-// ── ACLED sidebar strip ───────────────────────────────────────────────────────
-
-function AcledStrip({ events }: { events: AcledEvent[] }) {
-  if (!events.length) return null
-  return (
-    <div className="bg-slate-900 border border-red-900 rounded p-2 space-y-1">
-      <div className="flex items-center gap-2 mb-1">
-        <span className="text-xs font-semibold text-red-400 uppercase tracking-wide">ACLED Events</span>
-        <span className="text-xs text-slate-600" title="ACLED: Armed Conflict Location & Event Data. Non-commercial use only.">
-          Non-commercial · geo-matched
-        </span>
-      </div>
-      {events.slice(0, 6).map((ev, i) => (
-        <div key={`${ev.event_id ?? i}`} className="text-xs border-l-2 border-red-800 pl-2">
-          <div className="flex items-center gap-1.5 text-slate-400">
-            <span className="text-red-400 font-semibold shrink-0">{ev.event_date}</span>
-            <span className="text-slate-500">·</span>
-            <span className="text-slate-300">{ev.matched_node_name}</span>
-            <span className="text-slate-500">({ev.distance_km} km)</span>
-          </div>
-          <div className="text-slate-500 mt-0.5">{ev.event_type} · {ev.location}, {ev.country}</div>
-          {ev.notes && <div className="text-slate-600 mt-0.5 truncate">{ev.notes}</div>}
-        </div>
-      ))}
-    </div>
-  )
-}
-
 // ── Node card ─────────────────────────────────────────────────────────────────
 
+interface NodeSignal {
+  node_id: string
+  news_count: number
+  latest_headline: string | null
+  worst_severity: string | null
+  most_exposed_label: string | null
+  exp_wti_pct: number | null
+  exp_brent_pct: number | null
+  exp_crack_usd: number | null
+}
+
 function NodeCard({
-  node, selected, onClick, risk,
+  node, selected, onClick, risk, signal,
 }: {
   node: OilNodeSummary
   selected: boolean
   onClick: () => void
   risk?: NodeRisk
+  signal?: NodeSignal
 }) {
   const isRefinery = node.type === 'refining_hub'
   const wti        = node.wti_pct_t0
@@ -421,6 +403,31 @@ function NodeCard({
           Brent {fmt_pct(brent)}
         </span>
       </div>
+
+      {/* Live news signal — folds the CURRENT feed onto this node */}
+      {signal && signal.news_count > 0 && (
+        <div
+          className="mt-1.5 pt-1.5 border-t border-slate-700/60 flex items-center gap-1.5 text-[10px] flex-wrap"
+          title={signal.latest_headline ?? ''}
+        >
+          <span className="px-1 py-0.5 rounded bg-orange-950 text-orange-300 font-semibold">
+            ● {signal.news_count} live
+          </span>
+          {signal.worst_severity && (
+            <span className={severityBg[signal.worst_severity as Severity] ?? 'bg-slate-800 text-slate-400'}>
+              {signal.worst_severity}
+            </span>
+          )}
+          {signal.exp_wti_pct != null && (
+            <span className={`font-mono ${signal.exp_wti_pct > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+              exp WTI {fmt_pct(signal.exp_wti_pct)}
+            </span>
+          )}
+          {signal.latest_headline && (
+            <span className="text-slate-500 truncate basis-full">{signal.latest_headline}</span>
+          )}
+        </div>
+      )}
     </button>
   )
 }
@@ -469,10 +476,18 @@ function NodeDetail({ detail }: { detail: OilNodeDetail }) {
         </div>
         {hasHistory ? (
           <>
-            <ImpactRow label="T+0" {...(hist.t0 || {})} isRefinery={isRefinery} />
-            <ImpactRow label="T+1" {...(hist.t1 || {})} isRefinery={isRefinery} />
-            <ImpactRow label="T+5" {...(hist.t5 || {})} isRefinery={isRefinery} />
-            <ImpactRow label="T+20" {...(hist.t20 || {})} isRefinery={isRefinery} />
+            {(['t0', 't1', 't5', 't20'] as const).map((h) => {
+              const m = hist[h] || {}
+              return (
+                <ImpactRow
+                  key={h}
+                  label={`T+${h.slice(1)}`}
+                  wti={m.wti_pct ?? null} brent={m.brent_pct ?? null}
+                  arb={m.arb_usd ?? null} crack={m.crack_usd ?? null}
+                  isRefinery={isRefinery}
+                />
+              )
+            })}
           </>
         ) : (
           <ImpactRow
@@ -521,13 +536,13 @@ function NodeDetail({ detail }: { detail: OilNodeDetail }) {
                   {a.restored && <span className="text-emerald-500">restored</span>}
                 </div>
                 <div className="flex gap-3 mt-0.5 font-mono">
-                  <span className={a.t0_wti_pct != null ? (a.t0_wti_pct > 0 ? 'text-emerald-400' : 'text-red-400') : 'text-slate-600'}>
-                    WTI T+0 {fmt_pct(a.t0_wti_pct)}
+                  <span className={a.t0?.wti_pct != null ? (a.t0.wti_pct > 0 ? 'text-emerald-400' : 'text-red-400') : 'text-slate-600'}>
+                    WTI T+0 {fmt_pct(a.t0?.wti_pct)}
                   </span>
-                  <span className={a.t5_wti_pct != null ? (a.t5_wti_pct > 0 ? 'text-emerald-400' : 'text-red-400') : 'text-slate-600'}>
-                    T+5 {fmt_pct(a.t5_wti_pct)}
+                  <span className={a.t5?.wti_pct != null ? (a.t5.wti_pct > 0 ? 'text-emerald-400' : 'text-red-400') : 'text-slate-600'}>
+                    T+5 {fmt_pct(a.t5?.wti_pct)}
                   </span>
-                  <span className="text-violet-400">Crack {fmt_dollar(a.t0_crack_usd)}</span>
+                  <span className="text-violet-400">Crack {fmt_dollar(a.t0?.crack_usd)}</span>
                 </div>
               </div>
             ))}
@@ -544,79 +559,6 @@ function NodeDetail({ detail }: { detail: OilNodeDetail }) {
   )
 }
 
-// ── Classification card ───────────────────────────────────────────────────────
-
-function ClassificationCard({ result }: { result: ClassificationResult }) {
-  const isRefinery = result.node_type === 'refining_hub'
-  return (
-    <div className="rounded border border-blue-700 bg-slate-900 p-3 space-y-2">
-      <div className="flex flex-wrap items-center gap-2">
-        {result.node_name ? (
-          <span className={`font-bold text-sm ${result.node_type ? nodeTypeText[result.node_type] : 'text-white'}`}>
-            {result.node_name}
-          </span>
-        ) : (
-          <span className="text-slate-400 text-sm">No node matched</span>
-        )}
-        {result.channel && <Chip label={result.channel} className={channelBg[result.channel]} title={result.channel === 'transport' ? 'Transport channel disruption' : 'Production channel disruption'} />}
-        <Chip label={result.severity} className={severityBg[result.severity]} title={`Severity multiplier: scare ×0.5 · outage ×1.0 · sustained ×1.6`} />
-        {result.restored && <Chip label="RESTORED (bearish flip)" className="bg-emerald-900 text-emerald-300" title="Disruption resolved. Sign flipped — expect reversal of initial move." />}
-        <Chip label={result.confidence} className={confidenceBg[result.confidence]} title={confidenceTitle[result.confidence]} />
-        <Chip label={result.source_tag} className="bg-slate-800 text-slate-300" title="HISTORY = from event-study database. PRIOR = structural model only." />
-      </div>
-
-      {result.why_it_matters && (
-        <div className="text-xs text-yellow-200/90 italic">{result.why_it_matters}</div>
-      )}
-
-      {result.region && (
-        <div className="text-xs text-slate-400">
-          Region: <span className="text-slate-200">{result.region}</span>
-          &nbsp;·&nbsp;Most exposed: <span className="text-yellow-300 font-semibold">{result.most_exposed_label}</span>
-        </div>
-      )}
-
-      {isRefinery && (
-        <div className="text-xs bg-amber-950 border border-amber-800 rounded px-2 py-1 text-amber-300">
-          Refinery sign-flip: crude bearish, crack bullish. Refinery down → crude demand falls, products tighten.
-        </div>
-      )}
-
-      <div className="grid grid-cols-4 gap-2 text-xs">
-        {[
-          { label: 'WTI', value: result.impact.wti_pct, fmt: fmt_pct, tip: 'West Texas Intermediate crude %' },
-          { label: 'Brent', value: result.impact.brent_pct, fmt: fmt_pct, tip: 'ICE Brent crude %' },
-          { label: 'Arb (Brent−WTI)', value: result.impact.arb_usd, fmt: fmt_dollar, tip: 'Brent-WTI spread change $/bbl' },
-          { label: 'Distillate Crack', value: result.impact.crack_usd, fmt: fmt_dollar, tip: 'HO × 42 − WTI change $/bbl' },
-        ].map(({ label, value, fmt, tip }) => (
-          <div key={label} className="bg-slate-800 rounded p-2 text-center" title={tip}>
-            <div className="text-slate-400 mb-0.5">{label}</div>
-            <div className={`font-mono font-bold text-sm ${
-              value == null ? 'text-slate-600' : (value > 0 ? 'text-emerald-400' : 'text-red-400')
-            }`}>
-              {fmt(value)}
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {result.analogs && result.analogs.length > 0 && (
-        <div className="text-xs">
-          <span className="text-slate-500">Analogs used: </span>
-          {result.analogs.map((a) => (
-            <span key={a.event_id} className="text-slate-300 mr-2">
-              {a.title.split(' ').slice(0, 4).join(' ')}…
-              <span className="text-slate-600 ml-1">(WTI T+0 {fmt_pct(a.t0_wti_pct)})</span>
-            </span>
-          ))}
-        </div>
-      )}
-
-      <div className="text-xs text-slate-500 italic">{result.reasoning}</div>
-    </div>
-  )
-}
-
 // ── Feed status banner ────────────────────────────────────────────────────────
 
 function FeedBanner({
@@ -627,21 +569,24 @@ function FeedBanner({
   onRetry: () => void
 }) {
   if (!status && !cachedAt) return null
-  const isLive   = status?.source !== 'empty'
+  const isLive     = status?.source !== 'empty'
   const isDegraded = status?.source === 'eia_rss'
+  const isAcled    = status?.source === 'acled_db' || status?.source === 'acled_live'
 
   return (
     <div className={`text-xs px-3 py-1.5 rounded flex items-center gap-2 flex-wrap ${
-      isDegraded ? 'bg-teal-950 text-teal-300 border border-teal-800'
-      : cachedAt  ? 'bg-slate-900 text-slate-400 border border-slate-700'
+      isAcled    ? 'bg-red-950 text-red-300 border border-red-900'
+      : isDegraded ? 'bg-teal-950 text-teal-300 border border-teal-800'
+      : cachedAt   ? 'bg-slate-900 text-slate-400 border border-slate-700'
       : 'bg-slate-900 text-slate-500 border border-slate-800'
     }`}>
       <span className={`font-semibold ${isLive ? '' : 'text-orange-400'}`}>
-        {status?.source === 'gdelt_db'   && '● GDELT DB'}
-        {status?.source === 'gdelt_live' && '● GDELT Live'}
-        {status?.source === 'eia_rss'    && '● EIA RSS (GDELT unavailable)'}
-        {status?.source === 'empty'      && '○ No feed'}
-        {!status?.source                 && '○ Status unknown'}
+        {status?.source === 'acled_db'    && '● ACLED Conflict Feed'}
+        {status?.source === 'acled_live'  && '● ACLED + Live Headlines'}
+        {status?.source === 'headlines'   && '● Live Headlines (FinancialJuice · Reuters · Trump)'}
+        {status?.source === 'eia_rss'     && '● EIA RSS'}
+        {status?.source === 'empty'       && '○ No feed'}
+        {!status?.source                  && '○ Status unknown'}
       </span>
       {status?.message && <span>{status.message}</span>}
       {cachedAt && (
@@ -669,19 +614,15 @@ export default function NewsTab() {
   const [selectedNode, setSelectedNode] = useState<string | null>(null)
   const [nodeDetail, setNodeDetail]     = useState<OilNodeDetail | null>(null)
   const [feedItems, setFeedItems]       = useState<EventCluster[]>([])
-  const [acledEvents, setAcledEvents]   = useState<AcledEvent[]>([])
   const [nodeRisks, setNodeRisks]       = useState<Record<string, NodeRisk>>({})
+  const [nodeSignals, setNodeSignals]   = useState<Record<string, NodeSignal>>({})
   const [feedStatus, setFeedStatus]     = useState<FeedStatus | null>(null)
-  const [activeResult, setActiveResult] = useState<ClassificationResult | null>(null)
-  const [manualText, setManualText]     = useState('')
-  const [classifying, setClassifying]   = useState(false)
   const [loadingFeed, setLoadingFeed]   = useState(true)
   const [loadingNodes, setLoadingNodes] = useState(true)
   const [loadingDetail, setLoadingDetail] = useState(false)
   const [feedError, setFeedError]       = useState<string | null>(null)
   const [cachedAt, setCachedAt]         = useState<string | null>(null)
   const [expandedUrl, setExpandedUrl]   = useState<string | null>(null)
-  const inputRef = useRef<HTMLTextAreaElement>(null)
 
   // Load nodes on mount (independent of feed)
   useEffect(() => {
@@ -713,8 +654,8 @@ export default function NewsTab() {
         }
       }
       setFeedStatus(d?.feed_status ?? null)
-      setAcledEvents(d?.acled_events ?? [])
       setNodeRisks(d?.node_risks ?? {})
+      setNodeSignals(d?.node_signals ?? {})
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       setFeedError(msg)
@@ -741,19 +682,6 @@ export default function NewsTab() {
       .finally(() => setLoadingDetail(false))
   }, [selectedNode])
 
-  async function handleClassify() {
-    const text = manualText.trim()
-    if (!text) return
-    setClassifying(true)
-    setActiveResult(null)
-    try {
-      const r = await api.post('/api/disruption/classify', { text })
-      if (r.data?.data) setActiveResult(r.data.data)
-    } catch { /* ignore */ } finally {
-      setClassifying(false)
-    }
-  }
-
   const groupedNodes: [string, OilNodeSummary[]][] = [
     ['Chokepoints', nodes.filter((n) => n.type === 'chokepoint')],
     ['Production Hubs', nodes.filter((n) => n.type === 'production_hub')],
@@ -763,60 +691,19 @@ export default function NewsTab() {
   return (
     <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 h-full">
 
-      {/* ── LEFT: Classify + Feed ─────────────────────────────────────────── */}
+      {/* ── LEFT: Live feed with inline forecasts ─────────────────────────── */}
       <div className="xl:col-span-2 space-y-3 min-h-0">
 
-        {/* Step ① — Classify */}
-        <div className="bg-energy-bg-secondary rounded border border-slate-700 p-3 space-y-2">
-          <div className="flex items-center gap-2 mb-1">
-            <span className="text-xs font-bold text-blue-400 bg-blue-950 rounded-full w-5 h-5 flex items-center justify-center shrink-0">1</span>
-            <span className="text-xs font-semibold text-energy-text-secondary uppercase tracking-wide">
-              Classify a Disruption Headline
-            </span>
-          </div>
-          <textarea
-            ref={inputRef}
-            value={manualText}
-            onChange={(e) => setManualText(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) handleClassify() }}
-            placeholder="Paste headline… e.g. 'Houthi drones target tankers in Red Sea, shipping diverts'"
-            rows={2}
-            className="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-200 placeholder-slate-600 resize-none focus:outline-none focus:border-blue-500"
-          />
-          <div className="flex items-center gap-2">
-            <button
-              onClick={handleClassify}
-              disabled={classifying || !manualText.trim()}
-              className="px-4 py-1.5 bg-blue-600 text-white text-sm rounded hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            >
-              {classifying ? 'Classifying…' : 'Classify → Impact'}
-            </button>
-            {manualText && (
-              <button
-                onClick={() => { setManualText(''); setActiveResult(null) }}
-                className="text-xs text-slate-500 hover:text-slate-300"
-              >
-                Clear
-              </button>
-            )}
-            <span className="text-xs text-slate-600 ml-auto">Ctrl+Enter to submit</span>
-          </div>
-        </div>
-
-        {/* Classifier result */}
-        {activeResult && <ClassificationCard result={activeResult} />}
-
-        {/* Step ② — Live feed */}
+        {/* Live feed — each item expands to its calibrated forecast */}
         <div className="bg-energy-bg-secondary rounded border border-slate-700 overflow-hidden">
           <div className="flex items-center justify-between px-3 py-2 border-b border-slate-700 flex-wrap gap-1">
             <div className="flex items-center gap-2">
-              <span className="text-xs font-bold text-blue-400 bg-blue-950 rounded-full w-5 h-5 flex items-center justify-center shrink-0">2</span>
               <span className="text-xs font-semibold text-energy-text-secondary uppercase tracking-wide">
-                Oil Market News Feed
+                Oil Market News → Disruption Forecast
               </span>
             </div>
             <div className="flex items-center gap-2">
-              <span className="text-xs text-slate-500">headline+URL only · click to expand impact</span>
+              <span className="text-xs text-slate-500">click an item to expand its calibrated forecast</span>
               {loadingFeed && <span className="text-xs text-blue-400 animate-pulse">Loading…</span>}
             </div>
           </div>
@@ -853,20 +740,20 @@ export default function NewsTab() {
                     item={item}
                     isExpanded={expandedUrl === item.url}
                     onToggle={() => setExpandedUrl(expandedUrl === item.url ? null : item.url)}
-                    onClassify={setActiveResult}
                   />
                 </div>
               ))
             )}
           </div>
 
-          {/* ACLED strip below feed */}
-          {acledEvents.length > 0 && (
-            <div className="px-3 pb-3 mt-2 border-t border-slate-800 pt-2">
-              <AcledStrip events={acledEvents} />
-            </div>
-          )}
+          {/* ACLED events are now merged into the main feed above as EventCards */}
         </div>
+
+        {/* Trump posts → oil-complex impact (folded in from the old separate tab) */}
+        <TrumpImpactPanel />
+
+        {/* Model accuracy — plain-language back-test + predicted-vs-actual prices */}
+        <ModelAccuracy />
 
         {/* Honesty footer */}
         <div className="text-xs text-slate-600 space-y-0.5 pb-2">
@@ -903,6 +790,7 @@ export default function NewsTab() {
                         selected={selectedNode === n.id}
                         onClick={() => setSelectedNode(selectedNode === n.id ? null : n.id)}
                         risk={nodeRisks[n.id]}
+                        signal={nodeSignals[n.id]}
                       />
                     ))}
                   </div>
