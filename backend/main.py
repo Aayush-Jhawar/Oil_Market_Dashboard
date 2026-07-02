@@ -32,7 +32,11 @@ eia_fetcher = EIAFetcher()
 cftc_fetcher = CFTCFetcher()
 from signal_calc import SignalCalculator
 from services.multi_factor_engine import compute_multi_factor_score, calculate_relative_strength
+from services.composite_score import get_composite as get_model_composite
 from ws_snapshot import register_router as register_ws_snapshot
+
+# Base commodities that have a trained ML model driving the composite score.
+_MODEL_SYMBOLS = {"WTI", "Brent", "RBOB", "HO", "GO"}
 from hurricane import StormTracker
 from ais import TankerTracker
 from datetime import datetime, timedelta
@@ -73,6 +77,13 @@ try:
     register_ws_snapshot(app)
 except Exception:
     pass
+
+# Model Analytics endpoints (/api/models/*) for the composite-score models.
+try:
+    from ml.api import router as models_router
+    app.include_router(models_router)
+except Exception as _mr_err:
+    logger.warning(f"model analytics router not mounted: {_mr_err}")
 
 @app.on_event("startup")
 async def startup_event():
@@ -159,7 +170,7 @@ async def _signals_publisher():
                     pass
             
             by_symbol = {}
-            all_target_symbols = ["WTI", "Brent", "RBOB", "HO", "3-2-1CRACK", "GASCRACK", "DIESELCRACK", "WTI_FLY", "BRENT_FLY", "RBOB_FLY", "HO_FLY", "WTI-Brent", "DUB-WTI"]
+            all_target_symbols = ["WTI", "Brent", "RBOB", "HO", "GO", "3-2-1CRACK", "GASCRACK", "DIESELCRACK", "WTI_FLY", "BRENT_FLY", "RBOB_FLY", "HO_FLY", "WTI-Brent", "DUB-WTI"]
 
             for sym in all_target_symbols:
                 hist = await loop.run_in_executor(None, PriceFetcher.fetch_historical, sym, "3mo")
@@ -193,6 +204,21 @@ async def _signals_publisher():
                     "vol_regime": SignalCalculator.get_vol_regime(vol),
                     "factor_scores": mf.get("factor_scores", {}),
                 }
+
+                # Anchor the headline on the trained directional model for the
+                # base commodities (5d horizon) so the composite stops cancelling
+                # to ~0. The technical `mf` result is retained as the factor
+                # breakdown + a 25% adjustment inside get_model_composite. Falls
+                # back to the tech score untouched if no model / import fails.
+                if sym in _MODEL_SYMBOLS:
+                    try:
+                        merged = await loop.run_in_executor(
+                            None, get_model_composite, sym, "5d", by_symbol[sym], news_sentiment
+                        )
+                        if merged:
+                            by_symbol[sym] = merged
+                    except Exception as _mc_err:
+                        logger.debug(f"model composite skipped for {sym}: {_mc_err}")
 
             wti_res = by_symbol.get("WTI", {})
 

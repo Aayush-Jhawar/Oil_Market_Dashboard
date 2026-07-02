@@ -248,12 +248,16 @@ def build_snapshot(tick: int = 0) -> Dict[str, Any]:
     try:
         from main import _latest_intraday
         
-        # Get WTI AI predictions for composite score override
+        # Header composite comes from the model-driven signal that
+        # _signals_publisher stores in _latest_intraday as a 0-100 `trade_score`
+        # (= 50 + composite/2). Invert with *2 to recover the true [-100, +100]
+        # composite. IMPORTANT: keep this *2 in sync with the mapping in
+        # main.py _signals_publisher — dropping it silently halves the gauge.
         latest = _latest_intraday.get("WTI", {})
         if "trade_signal" in latest and "trade_score" in latest["trade_signal"]:
             score = latest["trade_signal"].get("trade_score", 50)
             if score is not None:
-                composite_score = float(score) - 50.0
+                composite_score = (float(score) - 50.0) * 2.0
                 # Derive directional regime from trade score, NOT from curve structure
                 if composite_score > 20:
                     regime = "BULLISH"
@@ -289,21 +293,26 @@ def build_snapshot(tick: int = 0) -> Dict[str, Any]:
             "weights": sym_mf.get("weights", {}),
         }
         
-        # Override with AI trade score if available
+        # Override with the model-driven composite that _signals_publisher wrote
+        # into _latest_intraday. trade_score = 50 + composite/2, so recover the
+        # true composite with *2 (see the header note above — keep in sync).
         try:
             from main import _latest_intraday
             latest_sym = _latest_intraday.get(sym, {})
-            if "trade_signal" in latest_sym and "trade_score" in latest_sym["trade_signal"]:
-                score = latest_sym["trade_signal"].get("trade_score")
-                if score is not None:
-                    cs = float(score) - 50.0
-                    signals_by_symbol[sym]["composite_score"] = cs
-                    if cs > 20:
-                        signals_by_symbol[sym]["regime"] = "BULLISH"
-                    elif cs < -20:
-                        signals_by_symbol[sym]["regime"] = "BEARISH"
-                    else:
-                        signals_by_symbol[sym]["regime"] = "NEUTRAL"
+            ts = latest_sym.get("trade_signal", {}) if isinstance(latest_sym, dict) else {}
+            if "trade_score" in ts and ts["trade_score"] is not None:
+                cs = (float(ts["trade_score"]) - 50.0) * 2.0
+                signals_by_symbol[sym]["composite_score"] = cs
+                if ts.get("direction"):
+                    signals_by_symbol[sym]["signal"] = ts["direction"]
+                if ts.get("confidence") is not None:
+                    signals_by_symbol[sym]["confidence"] = ts["confidence"]
+                if cs > 20:
+                    signals_by_symbol[sym]["regime"] = "BULLISH"
+                elif cs < -20:
+                    signals_by_symbol[sym]["regime"] = "BEARISH"
+                else:
+                    signals_by_symbol[sym]["regime"] = "NEUTRAL"
         except ImportError:
             pass
 

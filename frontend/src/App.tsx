@@ -7,7 +7,8 @@ import AlertStrip from './components/AlertStrip'
 import SettingsPanel from './components/Settings/SettingsPanel'
 import OverviewTab from './tabs/OverviewTab'
 import PricesTab from './tabs/PricesTab'
-import { PredictionTab } from './tabs/PredictionTab'
+import { TradeLogTab } from './tabs/TradeLogTab'
+import ModelAnalyticsTab from './tabs/ModelAnalyticsTab'
 import NewsTab from './tabs/NewsTab'
 import AnchorDataTab from './tabs/AnchorDataTab'
 import SpreadsPanel from './components/SpreadsPanel'
@@ -158,7 +159,8 @@ function App() {
               { id: 'spreads' as DashboardTab, label: 'Spreads' },
               { id: 'news' as DashboardTab, label: 'News & Forecast' },
               { id: 'anchor' as DashboardTab, label: 'EIA Anchors' },
-              { id: 'prediction' as DashboardTab, label: 'Predictions' },
+              { id: 'models' as DashboardTab, label: 'Model Analytics' },
+              { id: 'tradelog' as DashboardTab, label: 'Trade Log' },
               // { id: 'backtest' as DashboardTab, label: 'Backtest' },
               { id: 'portfolio' as DashboardTab, label: 'Risk & Portfolio' },
             ] as Array<{ id: DashboardTab; label: string }> ).map((tab) => (
@@ -217,9 +219,15 @@ function App() {
               </div>
             )}
 
-            {activeTab === 'prediction' && (
+            {activeTab === 'models' && (
               <div className="space-y-6">
-                <PredictionTab />
+                <ModelAnalyticsTab />
+              </div>
+            )}
+
+            {activeTab === 'tradelog' && (
+              <div className="space-y-6">
+                <TradeLogTab />
               </div>
             )}
 

@@ -163,6 +163,8 @@ export type DashboardTab =
   | 'news'
   | 'anchor'
   | 'prediction'
+  | 'tradelog'
+  | 'models'
   | 'backtest'
   | 'portfolio'
 

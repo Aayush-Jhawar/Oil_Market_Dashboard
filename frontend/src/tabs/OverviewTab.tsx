@@ -98,6 +98,8 @@ function CompositeScoreCard({ signals, symbolSignal, selectedCommodity, classNam
   const [factors, setFactors] = useState<Record<string, FactorState>>(buildDefaultFactors())
   const [expandedFactor, setExpandedFactor] = useState<string | null>(null)
   const [showDetails, setShowDetails] = useState(false)
+  const [horizon, setHorizon] = useState<'1d' | '5d' | '21d'>('5d')
+  const [model, setModel] = useState<any>(null)
 
   // Sync actual weights from the backend
   useEffect(() => {
@@ -126,6 +128,17 @@ function CompositeScoreCard({ signals, symbolSignal, selectedCommodity, classNam
     }
   }, [signals?.weights])
 
+  // Fetch the trained model's composite for the selected commodity + horizon.
+  // This is what drives the gauge; it falls back to the snapshot composite_score
+  // if the endpoint is unavailable (e.g. no model trained for this symbol).
+  useEffect(() => {
+    let alive = true
+    axios.get(`${API_BASE}/api/models/${selectedCommodity}/score`, { params: { horizon } })
+      .then(res => { if (alive) setModel(res.data?.status === 'success' ? res.data.data : null) })
+      .catch(() => { if (alive) setModel(null) })
+    return () => { alive = false }
+  }, [selectedCommodity, horizon])
+
   const subScores: Record<string, number> = {
     ...(signals?.sub_scores ?? {}),
     ...(signals?.factor_scores ?? {}),
@@ -148,13 +161,19 @@ function CompositeScoreCard({ signals, symbolSignal, selectedCommodity, classNam
     return Math.round(score * 100 * 10) / 10
   }, [factors, subScores])
 
-  const displayScore = showDetails ? liveScore : compositeScore
+  // The gauge shows the trained model's composite for the selected horizon when
+  // available; the "factor controls" view still shows the locally-recomputed
+  // liveScore so the sliders stay interactive.
+  const modelScore = model?.composite_score
+  const headlineScore = modelScore != null ? modelScore : compositeScore
+  const displayScore = showDetails ? liveScore : headlineScore
   // Regime here is DIRECTIONAL only (BULLISH/BEARISH/NEUTRAL) — curve structure is separate
-  const regime = signals?.regime || (displayScore > 30 ? 'BULLISH' : displayScore < -30 ? 'BEARISH' : 'NEUTRAL')
+  const regime = (modelScore != null ? model?.regime : signals?.regime)
+    || (displayScore > 30 ? 'BULLISH' : displayScore < -30 ? 'BEARISH' : 'NEUTRAL')
   const regimeColor = regime.includes('BULLISH') ? '#10B981' : regime.includes('BEARISH') ? '#EF4444' : '#6B7280'
   const regimeType = signals?.regime_type   // 'TRENDING', 'RANGING', 'HIGH_VOL'
-  const signal = signals?.signal ?? 'NEUTRAL'
-  const confidence = signals?.confidence ?? 0
+  const signal = (modelScore != null ? model?.signal : signals?.signal) ?? 'NEUTRAL'
+  const confidence = (modelScore != null ? model?.confidence : signals?.confidence) ?? 0
 
   const activeFactor = Object.entries(factors).filter(([, v]) => v.enabled)
   const totalWeight = activeFactor.reduce((s, [, v]) => s + v.weight, 0)
@@ -177,6 +196,25 @@ function CompositeScoreCard({ signals, symbolSignal, selectedCommodity, classNam
 
   return (
     <Card title={`Composite Score (${selectedCommodity})`} className={className}>
+
+      {/* Horizon selector + link to Model Analytics */}
+      <div className="flex items-center justify-between mb-1">
+        <div className="flex gap-1">
+          {(['1d', '5d', '21d'] as const).map(h => (
+            <button key={h} onClick={() => setHorizon(h)}
+              className={`px-2 py-0.5 rounded text-[11px] font-semibold transition ${
+                horizon === h ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-400 hover:bg-slate-700'}`}>
+              {h}
+            </button>
+          ))}
+        </div>
+        <button
+          onClick={() => useLegacyStore.getState().setActiveTab('models')}
+          className="text-[11px] font-semibold text-sky-400 hover:text-sky-300"
+        >
+          Model Analytics →
+        </button>
+      </div>
 
       {/* Gauge */}
       <div className="flex flex-col items-center justify-center py-4">
@@ -222,6 +260,17 @@ function CompositeScoreCard({ signals, symbolSignal, selectedCommodity, classNam
             <span style={{ fontSize: 10, color: '#4A6A96' }}>conf {(confidence * 100).toFixed(0)}%</span>
           )}
         </div>
+
+        {/* Model provenance — which trained model drives this score + its OOS accuracy */}
+        {model?.model_name && (
+          <div className="mt-1 text-[10px] text-slate-500 flex items-center gap-1.5">
+            <span>{horizon} · <span className="text-slate-300 font-mono">{model.model_name}</span></span>
+            {model.model_oos_accuracy != null && (
+              <span>· {(model.model_oos_accuracy * 100).toFixed(0)}% OOS acc</span>
+            )}
+            {model.model_underperforms && <span className="text-amber-400">· weak</span>}
+          </div>
+        )}
 
         {/* Commodity Technical Indicators */}
         {symbolSignal && (
