@@ -70,8 +70,8 @@ export default function UnifiedMarketStructurePanel({ symbol = "WTI" }: { symbol
           <div className="flex justify-between items-center text-sm">
             <div>
               <span className="text-slate-400 mr-2">Structure:</span>
-              <Badge variant={meta.structure === 'BACKWARDATION' ? 'amber' : meta.structure === 'CONTANGO' ? 'blue' : 'neutral'}>
-                {meta.structure}
+              <Badge variant={String(meta.structure).includes('BACKWARDATION') ? 'amber' : String(meta.structure).includes('CONTANGO') ? 'blue' : 'neutral'}>
+                {String(meta.structure ?? 'UNKNOWN').replace(/_/g, ' ')}
               </Badge>
             </div>
             <div>

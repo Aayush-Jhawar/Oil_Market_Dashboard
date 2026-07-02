@@ -19,8 +19,8 @@ export function MacroSignalPulseCard() {
       <div className="space-y-3 text-sm">
         <div className="flex justify-between items-center">
           <div className="text-xs text-energy-text-secondary">Curve</div>
-          <Badge variant={market?.curve === 'BACKWARDATION' ? 'green' : market?.curve === 'CONTANGO' ? 'amber' : 'neutral'}>
-            {market?.curve ?? 'Initializing...'}
+          <Badge variant={market?.curve?.includes('BACKWARDATION') ? 'amber' : market?.curve?.includes('CONTANGO') ? 'blue' : 'neutral'}>
+            {market?.curve ? market.curve.replace(/_/g, ' ') : 'Initializing...'}
           </Badge>
         </div>
         <div className="flex justify-between items-center">

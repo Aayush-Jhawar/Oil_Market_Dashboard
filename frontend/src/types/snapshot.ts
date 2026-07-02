@@ -55,7 +55,7 @@ export interface DashboardSnapshot {
       price: number;
       change_pct: number;
     }>;
-    structure?: 'BACKWARDATION' | 'CONTANGO' | 'FLAT' | 'UNKNOWN';
+    structure?: 'EXTREME_BACKWARDATION' | 'BACKWARDATION' | 'FLAT' | 'CONTANGO' | 'EXTREME_CONTANGO' | 'UNKNOWN';
     m1_m12_spread?: number | null;
     m1_price?: number | null;
     m12_price?: number | null;

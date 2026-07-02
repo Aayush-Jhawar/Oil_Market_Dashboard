@@ -386,14 +386,20 @@ def fetch_forward_curve(symbol: str = "WTI", force: bool = False) -> Tuple[List[
     )
     spread = round(m12_price - m1_price, 4) if m1_price and m12_price else None
 
-    if spread is None:
+    # Curve-structure label is standardized on the M1-M6 annualized roll-yield regime
+    # (regime_classifier) — the single source of truth also used by the header pills,
+    # the trading logic and the paper engine — rather than a raw M1-M12 $ spread, so
+    # every surface agrees. m1_m12_spread above is retained purely as an info number.
+    try:
+        from services.regime_classifier import regime_classifier
+        numeric_curve = {
+            int(p["month"][1:]): p["price"]
+            for p in curve_points if p["month"][1:].isdigit()
+        }
+        structure = regime_classifier.structure_for(symbol, numeric_curve)
+    except Exception as exc:
+        logger.warning(f"forward_curve: structure classify failed for {symbol}: {exc}")
         structure = "UNKNOWN"
-    elif spread < -0.05:
-        structure = "BACKWARDATION"
-    elif spread > 0.05:
-        structure = "CONTANGO"
-    else:
-        structure = "FLAT"
 
     meta = {
         "structure": structure,

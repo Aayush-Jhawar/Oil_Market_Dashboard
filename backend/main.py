@@ -1289,9 +1289,17 @@ def get_enhanced_signals():
         wti_price = prices.get("WTI", {}).get("close")
         brent_price = prices.get("Brent", {}).get("close")
         
-        # Determine curve from synthetic M1-M12 spread
-        m1_m12_spread = -4.40 if wti_price else None  # Simulated backwardation
-        curve_label = "BACKWARDATION" if m1_m12_spread and m1_m12_spread < 0 else "CONTANGO"
+        # Curve structure + M1-M12 spread from the canonical forward-curve service.
+        # Standardized on the M1-M6 roll-yield regime — the same label the header pills
+        # and the Term Structure panel show (no more synthetic/hardcoded spread).
+        try:
+            from services.forward_curve import fetch_forward_curve
+            _, _wti_meta = fetch_forward_curve("WTI")
+            m1_m12_spread = _wti_meta.get("m1_m12_spread")
+            curve_label = _wti_meta.get("structure", "UNKNOWN")
+        except Exception:
+            m1_m12_spread = None
+            curve_label = "UNKNOWN"
 
         cracks = SignalCalculator.calculate_crack_spreads(
             rbob=float(prices.get("RBOB", {}).get("close", 0)),
