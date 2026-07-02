@@ -107,7 +107,13 @@ def load_oos(symbol, horizon) -> Optional[pd.DataFrame]:
     path = os.path.join(ARTIFACT_DIR, oos_artifact_name(symbol, horizon))
     if not os.path.exists(path):
         return None
-    return pd.read_parquet(path)
+    try:
+        return pd.read_parquet(path)
+    except Exception as e:
+        # e.g. on a deploy where *.parquet is an unresolved Git-LFS pointer.
+        # The manifest-based charts still work; only the raw OOS table is lost.
+        logger.warning("load_oos(%s/%s) unreadable (LFS pointer?): %s", symbol, horizon, e)
+        return None
 
 
 # ── Best-effort DB mirror ────────────────────────────────────────────────────
