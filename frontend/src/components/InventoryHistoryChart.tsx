@@ -14,7 +14,7 @@ const SERIES: { key: string; label: string }[] = [
   { key: 'distillate', label: 'Distillate' },
 ]
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
+const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 
 interface BandPoint { week: number; min: number; max: number; avg: number; current: number | null }
 

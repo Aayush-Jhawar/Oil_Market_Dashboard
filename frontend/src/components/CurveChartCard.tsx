@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import axios from 'axios'
 import { ResponsiveContainer, LineChart, Line, CartesianGrid, XAxis, YAxis, Tooltip, ReferenceLine } from 'recharts'
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
+const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 const MONTHS = Array.from({ length: 12 }, (_, i) => i + 1)
 const PRODUCTS = ['WTI', 'Brent', 'RBOB', 'HO', 'GO']
 

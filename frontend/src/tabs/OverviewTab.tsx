@@ -10,7 +10,7 @@ import PriceHistoryChart from '../components/PriceHistoryChart'
 import PaperTrading from '../components/PaperTrading'
 import UnifiedMarketStructurePanel from '../components/UnifiedMarketStructurePanel'
 
-const API_BASE = (import.meta as any).env?.VITE_API_BASE || 'http://localhost:8000'
+const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 
 // ─── Factor metadata ─────────────────────────────────────────────────────────
 

@@ -40,7 +40,7 @@ export default function AnchorDataTab() {
   const [loading, setLoading] = useState(!tankerData || !stormData || Object.keys(anchorData).length === 0)
   const [error, setError] = useState<string | null>(null)
   const snapshot: any = null // Snapshot not actively used when global store retains state
-  const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
+  const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 
   useEffect(() => {
     const loadData = async () => {

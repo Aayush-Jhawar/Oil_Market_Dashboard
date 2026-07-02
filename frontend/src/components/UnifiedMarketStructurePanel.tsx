@@ -15,7 +15,8 @@ export default function UnifiedMarketStructurePanel({ symbol = "WTI" }: { symbol
     const fetchData = async () => {
       setLoading(true);
       try {
-        const res = await axios.get(`http://localhost:8000/api/analytics/structure?symbol=${symbol}`);
+        const API_BASE = import.meta.env.VITE_API_BASE ?? '';
+        const res = await axios.get(`${API_BASE}/api/analytics/structure?symbol=${symbol}`);
         if (res.data.status === 'success') {
           setData(res.data.data);
         }

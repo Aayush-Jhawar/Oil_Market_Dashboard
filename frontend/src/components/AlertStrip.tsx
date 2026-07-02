@@ -21,7 +21,7 @@ interface SpreadSummary {
 const AlertStrip: React.FC = () => {
   const [alerts, setAlerts] = useState<AlertItem[]>([])
   const [spreads, setSpreads] = useState<SpreadSummary[]>([])
-  const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
+  const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 
   useEffect(() => {
     const fetchAlerts = async () => {

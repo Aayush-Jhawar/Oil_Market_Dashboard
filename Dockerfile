@@ -48,6 +48,10 @@ COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 # Copy full source
 COPY . .
 
+# Setup runtime databases from deploy seeds
+RUN cp backend/energy_deploy.db backend/energy.db || true
+RUN cp DB/bars_15min_deploy.db DB/bars_15min_latest.db || true
+
 EXPOSE 7860
 
 ENV PYTHONUNBUFFERED=1

@@ -13,7 +13,7 @@ const INDICATORS: { key: string; label: string; color: string; fmt: (v: number) 
   { key: 'GOLD', label: 'Gold', color: '#eab308', fmt: v => v.toFixed(0) },
 ]
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
+const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 
 export default function MacroHistoryChart() {
   const [indicator, setIndicator] = useState('DXY')
